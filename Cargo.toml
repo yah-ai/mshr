@@ -1,0 +1,16 @@
+# mshr is its own Cargo workspace — promoted out of xlb-net (R593-T1,
+# 2026-07-02): the machine-identity / iroh-transport layer underneath xlb's
+# blob distribution, cheers' LAN-pair, and yubaba's raft roadmap. Kept as an
+# independent workspace (not a yah root-workspace member) so it stays
+# buildable standalone once exported to github.com/yah-ai/mshr — see
+# scripts/export-oss.sh and root Cargo.toml's `exclude = ["oss", "external"]`.
+[workspace]
+members = ["crates/mshr"]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.18"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/mshr"
