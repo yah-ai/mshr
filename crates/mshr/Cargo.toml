@@ -1,6 +1,6 @@
 [package]
 name = "mshr"
-version = "0.8.18"
+version = "0.8.20"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -27,6 +27,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
 tracing = "0.1"
 url = "2"
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3.23"

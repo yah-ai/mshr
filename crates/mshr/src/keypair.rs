@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 use iroh::SecretKey;
+use zeroize::Zeroizing;
 
 use crate::{Error, NodeId, Result};
 
@@ -53,8 +54,12 @@ impl Keypair {
             return Ok(Self { secret });
         }
 
-        let secret = SecretKey::generate();
-        write_secret_atomic(&secret_path, &secret)?;
+        // First run: generate a candidate and try to claim the on-disk secret
+        // via an O_EXCL create on the *final* path. If a concurrent process
+        // beat us to it, `write_secret_converge` reads its key back and we
+        // adopt it, so racing first-run processes converge on one key instead
+        // of clobbering each other's identity.
+        let secret = write_secret_converge(&secret_path, SecretKey::generate())?;
         write_public(&dir.join(PUBLIC_FILENAME), &secret)?;
         Ok(Self { secret })
     }
@@ -103,38 +108,161 @@ fn read_secret(path: &Path) -> Result<Option<SecretKey>> {
     Ok(Some(SecretKey::from_bytes(&arr)))
 }
 
-fn write_secret_atomic(path: &Path, secret: &SecretKey) -> Result<()> {
-    let bytes = secret.to_bytes();
-    write_atomic(path, &bytes, 0o600)?;
-    Ok(())
+/// Claim the on-disk secret at `path`, converging with concurrent creators.
+///
+/// The candidate's raw bytes are wiped from memory on drop (`Zeroizing`). We
+/// attempt to create `path` exclusively (O_EXCL, via a fully-written temp
+/// hard-linked into place); if we win, the passed `candidate` is returned. If
+/// another process created it first (`AlreadyExists`), we read the winning key
+/// back and adopt it so every racing first-run process ends up with the same
+/// key on disk and in memory.
+fn write_secret_converge(path: &Path, candidate: SecretKey) -> Result<SecretKey> {
+    let bytes = Zeroizing::new(candidate.to_bytes());
+    if write_new_atomic(path, &bytes[..], 0o600)? {
+        Ok(candidate)
+    } else {
+        read_secret(path)?
+            .ok_or_else(|| Error::Keypair("secret vanished during concurrent create".into()))
+    }
 }
 
 fn write_public(path: &Path, secret: &SecretKey) -> Result<()> {
     let pubkey = secret.public();
     let line = format!("{}\n", hex::encode(pubkey.as_bytes()));
+    // The public file is derived data (identical for a given secret), so a
+    // last-writer-wins rename is fine here.
     write_atomic(path, line.as_bytes(), 0o644)?;
     Ok(())
 }
 
-fn write_atomic(path: &Path, contents: &[u8], _mode: u32) -> io::Result<()> {
-    // Write to a sibling temp file, then rename. On unix, set mode on the
-    // temp file before rename so the final inode is created with the right
-    // permissions.
-    let tmp = path.with_extension("tmp");
-    {
+/// A unique sibling temp path: `<name>.<pid>.<nonce>.<seq>.tmp`.
+///
+/// The pid disambiguates processes, a process-local random `nonce` defeats
+/// reuse of a stale/leftover temp from a crashed peer that happened to share a
+/// pid, and the per-call `seq` counter keeps concurrent writes within this
+/// process distinct (so the secret and public writes never share a temp).
+fn unique_tmp_path(final_path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    // One CSPRNG draw per process, reusing the key generator the crate already
+    // depends on (rather than Date/SystemTime, which is guessable/repeatable).
+    static NONCE: OnceLock<u64> = OnceLock::new();
+    let nonce = *NONCE.get_or_init(|| {
+        let seed = Zeroizing::new(SecretKey::generate().to_bytes());
+        u64::from_le_bytes(seed[..8].try_into().expect("32 >= 8 bytes"))
+    });
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let stem = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "identity".to_string());
+    let tmp_name = format!("{stem}.{pid}.{nonce:016x}.{seq}.tmp", pid = std::process::id());
+    match final_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
+}
+
+/// Write `contents` to a freshly created, uniquely named temp sibling of
+/// `path` with the given `mode`, `sync_all` it, and return the temp path.
+///
+/// The temp is opened with `create_new(true)` (O_EXCL), which defeats symlink
+/// attacks and refuses to reuse a leftover temp; the mode is also set
+/// explicitly after creation so a restrictive/permissive umask can't leak
+/// through. Retries a handful of times if a same-named temp somehow exists.
+fn write_temp(path: &Path, contents: &[u8], mode: u32) -> io::Result<PathBuf> {
+    use std::io::Write;
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..8 {
+        let tmp = unique_tmp_path(path);
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(_mode);
+            opts.mode(mode);
         }
-        let mut f = opts.open(&tmp)?;
-        use std::io::Write;
-        f.write_all(contents)?;
-        f.sync_all()?;
+        match opts.open(&tmp) {
+            Ok(mut f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    f.set_permissions(fs::Permissions::from_mode(mode))?;
+                }
+                f.write_all(contents)?;
+                f.sync_all()?;
+                return Ok(tmp);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    fs::rename(&tmp, path)?;
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "could not create unique temp file")
+    }))
+}
+
+/// Atomically replace `path` with `contents` (temp + rename + parent fsync).
+fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let tmp = write_temp(path, contents, mode)?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Atomically create `path` with `contents` *only if it does not yet exist*.
+///
+/// Returns `Ok(true)` if we created it, `Ok(false)` if another writer got
+/// there first (so the caller can read the existing value back and converge).
+/// Content is written to a fully-`sync_all`'d temp and then hard-linked into
+/// place — `link(2)` fails with `AlreadyExists` if the target exists, giving
+/// O_EXCL semantics on the final path while keeping the write torn-free.
+fn write_new_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<bool> {
+    let tmp = write_temp(path, contents, mode)?;
+    let created = match fs::hard_link(&tmp, path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let _ = fs::remove_file(&tmp);
+    if created {
+        sync_parent_dir(path)?;
+    }
+    Ok(created)
+}
+
+/// fsync the directory containing `path` so the rename/link is durable. This
+/// is only meaningful on unix; skipped elsewhere (a directory can't be opened
+/// as a file handle on Windows without special flags).
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -176,5 +304,31 @@ mod tests {
         fs::write(dir.path().join(SECRET_FILENAME), b"too short").unwrap();
         let err = Keypair::load_or_create_at(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Keypair(_)), "got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_file_is_mode_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let _ = Keypair::load_or_create_at(dir.path()).unwrap();
+        let meta = fs::metadata(dir.path().join(PUBLIC_FILENAME)).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "public file mode should be 0644, got {mode:o}");
+    }
+
+    #[test]
+    fn no_temp_files_left_behind() {
+        let dir = tempdir().unwrap();
+        let _ = Keypair::load_or_create_at(dir.path()).unwrap();
+        // Both the hard-linked secret write and the rename'd public write must
+        // clean up their unique temps; only the two identity files remain.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 }
