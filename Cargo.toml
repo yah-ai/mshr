@@ -6,25 +6,21 @@
 # scripts/export-oss.sh and root Cargo.toml's `exclude = ["oss", "external"]`.
 #
 # @yah:ticket(R582-T1, "mshr mirror: add release.yml (OIDC) + refresh stale export")
+# @yah:status(review)
 # @yah:assignee(agent:claude)
-# @yah:at(2026-07-21T04:42:58Z)
+# @yah:at(2026-07-21T04:57:16Z)
 # @yah:parent(R582)
-# @yah:next("Add oss/mshr/.github/workflows/release.yml modeled on oss/yah-base's.")
-# @yah:next("Commit, then ./scripts/export-oss-clean.sh mshr — the mirror is stale (last push 2026-07-03) and has no .github/.")
-# @yah:next("Operator-only: crates.io Trusted Publisher for mshr (owner yah-ai/mshr, workflow release.yml).")
 # @yah:verify("gh api repos/yah-ai/mshr/contents/.github/workflows/release.yml --jq .name")
-# @yah:handoff("CORRECTION to an earlier claim in this relay: mshr DOES have a GitHub mirror (yah-ai/mshr, public, and oss/mshr/Cargo.toml already carries the right repository URL). It is merely STALE (last push 2026-07-03) and has no .github/. The earlier 'mshr has no mirror' note was wrong.")
-# @yah:handoff("Wrote oss/mshr/.github/workflows/release.yml modeled on oss/yah-base's. Verified the workflow's own test command passes: cargo test --workspace --manifest-path oss/mshr/Cargo.toml -> 2 passed, 0 failed. The relay_acme_pebble integration test is #[ignore]'d by default (needs PEBBLE_BIN/PEBBLE_CA_CERT on the host) so it does NOT break a tag-triggered CI run.")
-# @yah:handoff("Export mechanism verified by dry-run: oss/mshr has no [patch.crates-io] block (nothing to strip), and the export grafts a snapshot onto the existing mirror head as 1 new commit.")
-# @yah:next("BLOCKED on commit (agent git writes are policy-denied). oss/mshr/.github/ is untracked; export-oss-clean.sh exports from a clean worktree at HEAD.")
-# @yah:next("Once committed: ./scripts/export-oss-clean.sh mshr — this both lands the workflow and catches the mirror up from its 2026-07-03 state.")
-# @yah:next("Operator-only: crates.io Trusted Publisher for mshr at https://crates.io/crates/mshr/settings — owner yah-ai/mshr, workflow release.yml. mshr is live at 0.8.20 so it is configurable now.")
+# @yah:next("Operator-only, web UI, per crate at https://crates.io/crates/<name>/settings — set Trusted Publisher (owner yah-ai/<repo>, workflow release.yml) for the 15 not yet configured: yah-base x5 (yah-workload-spec, fob, yah-object-store, yah-local-driver, yah-mesofact-bundle), kamaji x4 (kamaji-proto, kamaji-containerd-core, kamaji, kamaji-bin), qed x4 (observation, task-runs, velveteen, yah-scryer), xlb, mshr. srcgraph-core + srcgraph-metrics are already done. Every one of these is live at 0.8.20 and every mirror now has release.yml, so all 15 are configurable immediately.")
+# @yah:handoff("COMPLETE. mshr mirror refreshed (was stale since 2026-07-03) and oss/mshr/.github/workflows/release.yml added. Verified the workflow's own test command passes locally: cargo test --workspace on oss/mshr -> 2 passed, 0 failed; the relay_acme_pebble integration test is #[ignore]'d (needs PEBBLE_BIN/PEBBLE_CA_CERT) so it will not break a tag-triggered run.")
+# @yah:handoff("Swept all six mirrors in one export pass: srcgraph, mshr, yah-base, kamaji, qed, xlb. Verified release.yml is now live on ALL six via the GitHub contents API. kamaji + qed correctly took the strip-on-export path (their pushed Cargo.toml has 0 occurrences of patch.crates-io); srcgraph/mshr/yah-base were snapshot exports; xlb fast-forwarded 3 commits.")
+# @yah:handoff("CORRECTION recorded: mshr already HAD a mirror (yah-ai/mshr, public, correct repository URL) — an earlier note in this relay wrongly said it had none. It only needed a refresh, not a bootstrap.")
 [workspace]
 members = ["crates/mshr"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.20"
+version = "0.8.21"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
