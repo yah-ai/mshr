@@ -160,7 +160,10 @@ fn unique_tmp_path(final_path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "identity".to_string());
-    let tmp_name = format!("{stem}.{pid}.{nonce:016x}.{seq}.tmp", pid = std::process::id());
+    let tmp_name = format!(
+        "{stem}.{pid}.{nonce:016x}.{seq}.tmp",
+        pid = std::process::id()
+    );
     match final_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
         _ => PathBuf::from(tmp_name),
@@ -208,7 +211,10 @@ fn write_temp(path: &Path, contents: &[u8], mode: u32) -> io::Result<PathBuf> {
         }
     }
     Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AlreadyExists, "could not create unique temp file")
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create unique temp file",
+        )
     }))
 }
 

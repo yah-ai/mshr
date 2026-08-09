@@ -23,10 +23,34 @@ pub mod discovery;
 pub mod endpoint;
 pub mod keypair;
 pub mod relay;
+pub mod seeds;
 
 pub use discovery::{default_relays, Discovery, PeerHint, PeerHintStream, PeerSource};
-pub use endpoint::{AcceptDecision, Acceptor, Endpoint, EndpointBuilder};
-pub use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
+pub use endpoint::{
+    AcceptDecision, Acceptor, Endpoint, EndpointBuilder, ACCEPTOR_DENY_ERROR_CODE,
+    ACCEPTOR_DENY_REASON,
+};
+pub use seeds::{RelayChoice, Seed, Seeds};
+// `ApplicationClose`/`ConnectionError` complete the accept-path surface: mshr
+// itself closes connections with an application error code
+// (`ACCEPTOR_DENY_ERROR_CODE`) and consumers do the same for their own
+// protocol-level refusals, so a consumer that cannot name `ConnectionError`
+// cannot tell its own close code from a deny, a timeout or a reset. Without
+// this the only way to read a close is a direct `iroh` dependency, which is
+// exactly what this crate exists to make unnecessary.
+//
+// The datagram half (R609-F6) is here for the same reason and it is the whole
+// of the ask: `Connection` already carries `send_datagram` / `read_datagram` /
+// `max_datagram_size`, but their argument, their error and their futures were
+// all unnameable from mshr, so the only way to *call* them was the `iroh`
+// dependency this crate exists to remove. `Bytes` is re-exported rather than
+// left to the caller for the same reason — `send_datagram` takes one, and a
+// consumer picking its own `bytes` version would be a silent type mismatch.
+pub use bytes::Bytes;
+pub use iroh::endpoint::{
+    ApplicationClose, Connection, ConnectionError, Incoming, ReadDatagram, RecvStream,
+    SendDatagram, SendDatagramError, SendStream,
+};
 pub use keypair::Keypair;
 
 // Re-export iroh's `RelayMap`/`RelayMode` so consumers can build custom

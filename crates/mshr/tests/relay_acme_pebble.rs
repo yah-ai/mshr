@@ -262,7 +262,10 @@ async fn relay_acme_pebble_round_trip() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(saw.load(Ordering::SeqCst), "alice handler ran via ACME-issued relay");
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "alice handler ran via ACME-issued relay"
+    );
 
     alice.close().await;
     bob.close().await;

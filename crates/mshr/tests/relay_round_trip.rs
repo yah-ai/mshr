@@ -104,13 +104,10 @@ async fn relay_round_trip_self_signed() {
 
     // Bob dials alice using only her NodeId + relay URL — no direct addrs
     // baked in. Resolution rides on the relay map.
-    let conn = tokio::time::timeout(
-        Duration::from_secs(20),
-        bob.connect_alpn(alice_addr, ALPN),
-    )
-    .await
-    .expect("connect within 20s")
-    .expect("bob connect");
+    let conn = tokio::time::timeout(Duration::from_secs(20), bob.connect_alpn(alice_addr, ALPN))
+        .await
+        .expect("connect within 20s")
+        .expect("bob connect");
 
     let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
     send.write_all(b"yah-via-relay").await.expect("write");

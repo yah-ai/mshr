@@ -126,7 +126,11 @@ impl Discovery {
     /// Enable the LAN lane only if the predicate is true. Ergonomic
     /// shortcut for `if cond { d.with_lan() } else { d }`.
     pub fn with_lan_if(self, cond: bool) -> Self {
-        if cond { self.with_lan() } else { self }
+        if cond {
+            self.with_lan()
+        } else {
+            self
+        }
     }
 
     /// Add pinned `EndpointAddr`s the endpoint should always know about.
@@ -209,6 +213,32 @@ impl Discovery {
     /// Number of attached external-roster sources.
     pub fn roster_count(&self) -> usize {
         self.rosters.len()
+    }
+
+    /// Whether any configured lane can turn a *bare* [`NodeId`] into a path.
+    ///
+    /// The single definition of that question in the crate —
+    /// [`crate::Seeds::resolves_bare_node_ids`] and
+    /// [`crate::Endpoint::resolves_bare_node_ids`] both delegate here, so a
+    /// caller cannot be told "yes" by one and "no" by another.
+    ///
+    /// A pinned seed counts only when it carries addresses or a relay of its
+    /// own: pinning a bare NodeId resolves nothing, it *is* the thing needing
+    /// resolution. Rosters count because a source exists to emit addresses,
+    /// even though it may not have emitted any yet.
+    ///
+    /// Worth asking at all because of what the failure looks like otherwise.
+    /// iroh does refuse a bare NodeId with no lane promptly — but with
+    /// `"No addressing information available"`, which names no lane, no
+    /// setting and no next step (the actionable half, `"No address lookup
+    /// configured"`, only reaches a WARN log). A caller that asks this first
+    /// can say which knob is missing instead. Pinned in
+    /// `tests/seeds_round_trip.rs`.
+    pub fn resolves_bare_node_ids(&self) -> bool {
+        self.lan
+            || !self.relay_urls.is_empty()
+            || !self.rosters.is_empty()
+            || self.static_seeds.iter().any(|a| !a.is_empty())
     }
 
     /// Apply the configured lanes to an `iroh::endpoint::Builder`. Called

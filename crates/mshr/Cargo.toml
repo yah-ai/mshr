@@ -1,6 +1,6 @@
 [package]
 name = "mshr"
-version = "0.8.21"
+version = "0.8.22"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
