@@ -104,13 +104,39 @@
 //! @yah:verify("cd oss/mshr && RUSTDOCFLAGS='-D warnings' cargo doc -p mshr --no-deps   # clean")
 //! @yah:verify("cd oss/xlb && cargo check -p xlb --all-targets   # clean — additive change breaks no consumer")
 //! @yah:verify("cd oss/yubaba && cargo check -p yubaba   # clean")
+//!
+//! @yah:relay(R945, "mshr endpoint lifecycle over noq/iroh 1.0.0-rc.0: close and rebind")
+//! @yah:at(2026-09-28T00:29:08Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//!
+//! @yah:ticket(R945-B1, "Endpoint::close never drains a server-side connection mid-handshake (MultipathNotNegotiated), noq/iroh 1.0.0-rc.0")
+//! @yah:status(review)
+//! @yah:at(2026-09-28T01:54:41Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R945)
+//! @yah:severity(high)
+//! @yah:next("Found by noisetable R749-B14 (2026-09-27). REPRO: two noisetable-desktop instances on one Mac, both in open durable rooms on the LAN lane. Rebind both at the same moment, which is what a multi-role etude Join does. Just before the rebind, desk A dials desk B on society/clock/1, and B accepts A's Initial. Then both call mshr Endpoint::close -> iroh EndpointInner::close -> noq Endpoint::close + wait_idle. A's close takes exactly 3.0s: a 3xPTO drain at the initial RTT, because A's own half-open handshake gets no reply. B's close NEVER returns. B's server-side connection (noq id=2) logs `WARN noq_proto::connection failed closing path err=MultipathNotNegotiated` about 15s later, and wait_idle is still pending at 30s. Healthy closes take 80-270ms. Rate: ~15-25% of noisetable `./scripts/etude-rigs.sh --no-build desktop-desktop` runs, with RUST_LOG=noq=debug,iroh=debug. EVIDENCE (on the noisetable machine): /tmp/b14r_i5/run4/desk-b.log lines 840-899 (B, hung close) and desk-a.log (A, the 3s close); a second capture is in /tmp/b14r_i4/run6.")
+//! @yah:next("Why a caller cannot bound it: once close has started, iroh EndpointInner::abort() returns early on is_closing(), so a timed-out close cannot be forced down and the UDP socket stays held by the noq drivers until the stuck connection drains. Wanted: (1) the stuck connection fixed upstream in noq (a server connection closed before multipath negotiation should still drain in 3xPTO); (2) mshr, and ideally iroh, gains a close that can be abandoned at a deadline and then really tears the endpoint down, releasing its sockets. noisetable works around this with a bounded close in crates/noise_table/core/src/node.rs spawn_society_endpoint (R749-B14).")
+//! @yah:next("MEASURED 2026-09-27 in noisetable R749-B14: a caller has NO way to release the ports. (a) Bounding iroh close() with a 1s timeout and then dropping the mshr Endpoint leaves the UDP sockets bound, so the next bind on the same ports fails with 'Failed to bind sockets' (/tmp/b14r_bc/run5). (b) Skipping close() and just dropping the Endpoint, iroh's abort path, ALSO never frees the ports: 12/12 rebinds fell back to fresh ports (/tmp/b14r_drop). A caller that must keep its address across a rebind (a peer or controller holding ip:port) therefore needs mshr to own a close that releases its sockets at a deadline, or the noq drain fix.")
+//! @yah:handoff("ROOT CAUSE (noq-proto 1.0.0-rc.0, crates.io, n0-owned; read in source): a server Connection whose FIRST datagram is the dialer's handshake-time CONNECTION_CLOSE (an Initial carrying only the close, which happens when the dialer's ClientHello never reached us and it then closed) enters Draining with no drain timer. Path: proto Endpoint::accept -> Connection::handle_first_packet -> process_decrypted_packet -> process_early_payload `Frame::Close => state.move_to_draining(..); return Ok(())`. handle_first_packet calls process_decrypted_packet directly, so it skips handle_packet's post-transition bookkeeping (connection/mod.rs ~4393: `if !was_closed && state.is_closed() { close_common(); set_close_timer(now) }`). The endpoint's later Close event is then a no-op (close_inner returns early on is_closed()). Nothing drains the connection except ConnTimer::Idle, i.e. noq's default max_idle_timeout of 30s. The `failed closing path err=MultipathNotNegotiated` warn is a symptom and not the cause: iroh's PATH_MAX_IDLE_TIMEOUT (15s) PathIdle timer was never reset (close_common never ran), and close_path_inner refuses because multipath was never negotiated. The ticket's hypothesis (a per-path close erroring and blocking the drain) is disproven. Evidence: /tmp/b14r_i5/run4/desk-b.log shows conn id=2 created from 192.168.0.36 and failing in mshr 'aborted by peer ... during the handshake' with no poll_send to that remote at all, and the warn fires 15s later.")
+//! @yah:handoff("CORRECTION: close does not hang forever. The repro measured bob.close() at 29.69s, which is 30s idle minus the gap before close started. It was 'forever' only relative to the 30s budget.")
+//! @yah:handoff("REPRO (mshr, fails before the fix): oss/mshr/crates/mshr/src/endpoint.rs test `close_is_bounded_when_a_dial_was_aborted_before_we_saw_it`. A UDP hop in front of bob drops alice's ClientHello, then opens just before alice.close(), so bob's first packet for that connection is the close-only Initial. Unfixed: FAILED, 'bob.close() still pending after 10.0s'; with a temporary 45s budget it took 29.69s. Fixed: passes in 5.6s. Outcome is Forced, close returns within DEFAULT_CLOSE_DEADLINE+2s, and bob's exact port rebinds within 1s.")
+//! @yah:handoff("FIX, in mshr, because noq/iroh are plain crates.io. iroh cannot abandon a close once it has started (abort() returns early on is_closing()), and it can cancel its tasks only through a private runtime token. So mshr now owns the task lifetime. New private `Driver`: a per-endpoint single-worker tokio runtime (thread `mshr-endpoint`). bind, connect_alpn, and the accept_dispatch handshake run on it via Driver::run, so noq's endpoint and connection drivers are spawned there. The ALPN handlers still run on the caller's runtime. `Endpoint::close()` now returns `CloseOutcome` and is bounded by the new `pub const DEFAULT_CLOSE_DEADLINE` (5s). The new `close_within(Duration)` runs iroh's graceful close; past the deadline it drops the runtime (spawn_blocking shutdown_timeout), which drops the drivers holding the sockets. Result is Drained or Forced, and it is idempotent through a OnceCell, so concurrent callers share the first outcome. The ports free once the last Endpoint clone drops, the same contract as a drained close. `Driver` Drop does shutdown_background. Exports: lib.rs CloseOutcome and DEFAULT_CLOSE_DEADLINE; CHANGELOG [Unreleased] entry 'Changed - Endpoint::close is bounded and releases its sockets'. Documented limit: connections created via inner() or a raw accept() Incoming spawn their driver on the caller's runtime, out of a forced close's reach.")
+//! @yah:handoff("WHY NOT THE ALTERNATIVES: an iroh custom transport (unstable-custom-transports) would change the address family peers dial and break the LAN/IP lanes. A shorter max_idle_timeout would bound only the wait, still not to 1s, and would change idle semantics for every connection. SO_REUSEPORT is ambiguous for unicast UDP. A plain drop, i.e. iroh's abort path, only works when no close has started.")
+//! @yah:handoff("VERIFIED. mshr: `cargo test -p mshr` gives lib 60 passed / 0 failed / 6 ignored; relay_round_trip 2, seeds 3, others green. The baseline lib was 59 + 6 ignored plus this new test, which failed pre-fix. clippy --all-targets: 0 warnings. `cargo check` on xlb (--all-targets) and yubaba: clean. noisetable consumer (R749-B14): 12/12 desktop-desktop rig runs pass with 0 redial misses; see that ticket.")
+//! @yah:handoff("DRAFTED UPSTREAM ISSUE for n0-computer/noq. NOT FILED: outward-facing, operator's call. Title: 'Server connection closed by its first packet never arms the drain timer (waits out max_idle_timeout)'. Body: if the first Initial a server accepts carries CONNECTION_CLOSE (the client aborted a dial whose earlier Initials were lost), Endpoint::accept -> Connection::handle_first_packet -> process_decrypted_packet -> process_early_payload moves the state to Draining but returns Ok. handle_first_packet bypasses handle_packet's `!was_closed && is_closed()` block, so close_common()/set_close_timer() never run. Endpoint::close() then no-ops on that connection, and Endpoint::wait_idle (hence iroh Endpoint::close) blocks until the 30s idle timer kills it. Stale PathIdle timers also fire and warn `failed closing path err=MultipathNotNegotiated`. Suggested patch: in handle_first_packet, after process_decrypted_packet, `if self.state.is_closed() { self.close_common(); if !self.state.is_drained() { self.set_close_timer(now) } }` (mirroring handle_packet), or route the first packet through the same post-processing. The repro shape is in mshr's test above.")
+//! @yah:gotcha("`RUSTDOCFLAGS='-D warnings' cargo doc -p mshr --no-deps` is RED, but not from this change: 4 pre-existing `unresolved link to Unreleased` errors inside other tickets' @yah prose (discovery.rs:49, endpoint.rs:203 R944, lan/mod.rs:516-517).")
+//! @yah:gotcha("Performance shift for every consumer: iroh/noq drivers now run on one dedicated `mshr-endpoint` worker per endpoint instead of the caller's runtime threads. That thread's QoS/priority is tokio's default. A realtime consumer (A108 datagrams) may want a knob for its priority.")
 
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use iroh::endpoint::{presets, Connection, Incoming, QuicTransportConfig};
+use iroh::endpoint::{presets, BindOpts, Connection, Incoming, QuicTransportConfig};
 use iroh::tls::CaRootsConfig;
 use iroh::{RelayMap, RelayMode};
 
@@ -179,6 +205,17 @@ where
 }
 
 /// Builder for [`Endpoint`]. Returned by [`Endpoint::builder`].
+///
+/// @yah:relay(R944, "mshr 0.8.42: land + release noisetable's uncommitted EndpointBuilder additions (segmentation_offload, bind_addr, TransportAddr re-export)")
+/// @yah:at(2026-10-01T23:04:08Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:next("Commit through yah's flow (NOT from noisetable): uncommitted in oss/mshr/crates/mshr. (1) noisetable R743-F27: EndpointBuilder::segmentation_offload(bool) in src/endpoint.rs (field + method + bind() wiring into QuicTransportConfig::enable_segmentation_offload, installed only when set, like the datagram knobs), test endpoint::tests::gso_off_still_carries_a_multi_megabyte_stream (3 MiB stream, GSO off both ends), CHANGELOG [Unreleased] entry 'Added - EndpointBuilder::segmentation_offload'. Why: iroh 1.0.0-rc.0 snapshots max_transmit_segments at TransportsSender creation (iroh socket/transports.rs:415, :1201), so noq-udp's EIO GSO fallback never reaches the connection and every multi-datagram flight is dropped on a NIC without GSO (Android emulator). (2) noisetable R743-F26: EndpointBuilder::bind_addr(addr, prefix_len) + `pub use iroh::TransportAddr` in lib.rs, tests bind_addr_pins_an_endpoint_to_its_named_socket / bind_addr_rejects_a_bad_prefix_at_bind.")
+/// @yah:next("Bump mshr to 0.8.42 (working copy is 0.8.41) and publish. `cargo test -p mshr --lib endpoint::` was 17 passed on 2026-09-25.")
+/// @yah:next("Unblocks noisetable: society_facility compiles today only under `scripts/devcrate.sh on mshr`. After the release noisetable sets crates/society/core/Cargo.toml mshr = 0.8.42 and runs `scripts/devcrate.sh off mshr` (tracked there on R743-F26 + R743-F27). Upstream follow-up worth filing with iroh: re-read max_transmit_segments after a GSO fallback instead of caching it.")
+/// @yah:handoff("2026-10-01: code + tests were already committed by sync commits (8fb16523..84caba1e); only gap was a CHANGELOG entry for bind_addr/TransportAddr, now added under [Unreleased] in oss/mshr/crates/mshr/CHANGELOG.md. cargo test -p mshr --lib endpoint:: -> 18 passed, 0 failed, 1 ignored. Operator asked for a full lockstep release instead of an mshr-only bump: started yah-release-wizard spec=0.8.42, run c8f664f2-5df6-4c0e-b07e-ec6a2f1a07a6. It parks at authorize-release (operator gate).")
+/// @yah:gotcha("The wizard's commit-and-tag runs `git commit -a` on the live tree, so it sweeps in whatever is uncommitted at that moment. At launch that included oss/cheers/crates/cheers-axum/src/passkey.rs and .yah/AGENTS.md, which are not R944 edits.")
+/// @yah:handoff("Wizard reruns at 0.8.42 were blocked by stale tests left by the store-plugin commits (3c7c8665/8fb16523), fixed in this pass: (a) app/yah/cli/src/plugin_grants.rs every_builtin_manifest_lowers_on_both_backends gained a yah-store arm (only outbound rule is the proxy's exact loopback port, proxy env set); live every_builtin_grant_set_produces_a_profile_that_boots now spawns with a stand-in egress proxy, since a hostname grant refuses to lower without one. plugin_grants:: 31/31 pass. (b) crates/yah/agent-tools/src/skill_tools.rs tripwire 11 -> 14 (chaos, store-asset-portal, store-console). Runs c8f664f2 and 1d900460 failed at release-check on these.")
+/// @yah:handoff("More release-check fixes: (c) crates/yah/fleet-metrics/tests/fleet_inventory_split.rs us-west-014 EXPECTED -> 100.64.0.11 (R935-T4 re-join). (d) oss/yubaba/crates/yubaba/cluster-epochs.json cluster_protocol surface re-recorded, NOT BREAKING, surface_rerecords entry 2026-10-01: R937-F3 added a `machine` key to GET /raft/status member JSON; all consumers tolerate unknown keys. (e) xtask/tests/mirror_ingress.rs: us-south-001 now declares cap:bundle-serving on disk (R936-B12); in-memory grant narrowed to us-west-001 and capable list updated; its no-appliance taint keeps live placements unchanged. Full workspace cargo test + xtask tests + drift guards green locally.")
 pub struct EndpointBuilder {
     keypair: Option<Keypair>,
     alpns: Vec<Alpn>,
@@ -191,6 +228,12 @@ pub struct EndpointBuilder {
     /// *disables* inbound datagrams. See
     /// [`EndpointBuilder::datagram_receive_buffer_size`].
     datagram_receive_buffer_size: Option<Option<usize>>,
+    /// `(addr, prefix_len)` sockets that *replace* iroh's default wildcard
+    /// sockets. Empty = iroh's defaults. See [`EndpointBuilder::bind_addr`].
+    bind_addrs: Vec<(SocketAddr, u8)>,
+    /// `Some(false)` turns UDP GSO off. `None` leaves iroh's default (on).
+    /// See [`EndpointBuilder::segmentation_offload`].
+    segmentation_offload: Option<bool>,
 }
 
 impl EndpointBuilder {
@@ -204,7 +247,36 @@ impl EndpointBuilder {
             acceptor: None,
             datagram_send_buffer_size: None,
             datagram_receive_buffer_size: None,
+            bind_addrs: Vec::new(),
+            segmentation_offload: None,
         }
+    }
+
+    /// Bind an IP socket on `addr`, whose local subnet is `prefix_len` bits
+    /// long. Repeatable. The first call **drops iroh's default wildcard
+    /// sockets** (`0.0.0.0:0` / `[::]:0`), so the endpoint then has exactly
+    /// the sockets named here and no others.
+    ///
+    /// This is how a caller pins an endpoint to one local interface: bind
+    /// only that interface's address. The prefix feeds iroh's source-socket
+    /// routing table (a destination inside the prefix leaves by this socket;
+    /// see `iroh::endpoint::BindOpts::set_prefix_len`). It chooses a socket
+    /// by subnet, not by interface — iroh sets no `IP_BOUND_IF` /
+    /// `SO_BINDTODEVICE` — so two interfaces sharing one subnet cannot be
+    /// told apart this way.
+    ///
+    /// Pinning is per *endpoint*, not per connection: iroh keeps one
+    /// selected path per remote `NodeId` across all of an endpoint's
+    /// connections to it. A caller wanting one connection on a different
+    /// path than another to the same peer needs a second endpoint with its
+    /// own keypair (R743-S15).
+    ///
+    /// Port 0 picks an ephemeral port. An invalid `prefix_len` (> 32 for
+    /// v4, > 128 for v6) or a second address of the same family is reported
+    /// by [`EndpointBuilder::bind`].
+    pub fn bind_addr(mut self, addr: SocketAddr, prefix_len: u8) -> Self {
+        self.bind_addrs.push((addr, prefix_len));
+        self
     }
 
     /// Attach a [`Discovery`] composition. When omitted, the endpoint
@@ -263,6 +335,30 @@ impl EndpointBuilder {
     /// evicting.
     pub fn datagram_send_buffer_size(mut self, bytes: usize) -> Self {
         self.datagram_send_buffer_size = Some(bytes);
+        self
+    }
+
+    /// Whether QUIC may batch several datagrams into one UDP Generic
+    /// Segmentation Offload send. Defaults to on (iroh's default).
+    ///
+    /// Turn it off on a host whose NIC cannot do GSO. In principle `noq-udp`
+    /// falls back by itself: the first GSO `sendmsg` that fails with `EIO`
+    /// sets its segment limit to 1. But iroh 1.0.0-rc.0 snapshots
+    /// `max_transmit_segments` once, when the transport sender is created
+    /// (`socket/transports.rs`), and keeps handing the connection the stale
+    /// value. So every later multi-segment transmit is built anyway and dropped
+    /// with `EIO`. Any flight larger than one datagram — a multi-MB stream
+    /// write, and whatever is queued behind it — never arrives, and PTO
+    /// retransmits of it are dropped the same way. Measured on the Android
+    /// emulator, whose virtio NIC has no checksum offload (noisetable
+    /// R743-F27).
+    ///
+    /// With this off, the connection itself caps every transmit at one
+    /// datagram (`noq-proto`'s `enable_segmentation_offload`), so the stale
+    /// socket value is never consulted. The cost is CPU per packet on bulk
+    /// sends, not correctness.
+    pub fn segmentation_offload(mut self, enabled: bool) -> Self {
+        self.segmentation_offload = Some(enabled);
         self
     }
 
@@ -331,8 +427,14 @@ impl EndpointBuilder {
         // on top, and those are load-bearing for holepunching — so it is the
         // right base to amend, but installing it unconditionally would still
         // pin values iroh is free to change between releases.
-        if self.datagram_send_buffer_size.is_some() || self.datagram_receive_buffer_size.is_some() {
+        if self.datagram_send_buffer_size.is_some()
+            || self.datagram_receive_buffer_size.is_some()
+            || self.segmentation_offload.is_some()
+        {
             let mut tc = QuicTransportConfig::builder();
+            if let Some(enabled) = self.segmentation_offload {
+                tc = tc.enable_segmentation_offload(enabled);
+            }
             if let Some(bytes) = self.datagram_send_buffer_size {
                 tc = tc.datagram_send_buffer_size(bytes);
             }
@@ -344,19 +446,32 @@ impl EndpointBuilder {
         if !alpns.is_empty() {
             b = b.alpns(alpns.clone());
         }
+        if !self.bind_addrs.is_empty() {
+            b = b.clear_ip_transports();
+            for (addr, prefix_len) in self.bind_addrs {
+                b = b
+                    .bind_addr_with_opts(addr, BindOpts::default().set_prefix_len(prefix_len))
+                    .map_err(|e| Error::Endpoint(format!("bind_addr {addr}/{prefix_len}: {e}")))?;
+            }
+        }
         let mut resolves_bare_node_ids = false;
         if let Some(d) = self.discovery {
             resolves_bare_node_ids = d.resolves_bare_node_ids();
             b = d.apply(b);
         }
 
-        let inner = b
-            .bind()
-            .await
+        // Bind on the endpoint's own runtime so every task iroh spawns for
+        // it (socket actors, the noq endpoint driver) lives there and can be
+        // dropped by a forced close. See [`Driver`].
+        let driver = Arc::new(Driver::new()?);
+        let inner = driver
+            .run(b.bind())
+            .await?
             .map_err(|e| Error::Endpoint(format!("bind failed: {e}")))?;
 
         Ok(Endpoint {
             inner,
+            driver,
             keypair,
             registered_alpns: Arc::new(alpns),
             acceptor: self.acceptor,
@@ -370,6 +485,7 @@ impl EndpointBuilder {
 #[derive(Clone)]
 pub struct Endpoint {
     inner: iroh::Endpoint,
+    driver: Arc<Driver>,
     keypair: Keypair,
     registered_alpns: Arc<Vec<Alpn>>,
     acceptor: Option<Arc<dyn Acceptor>>,
@@ -422,6 +538,11 @@ impl Endpoint {
 
     /// Borrow the wrapped `iroh::Endpoint`. Escape hatch — prefer the
     /// methods on this wrapper where possible so the dep stays swappable.
+    ///
+    /// A connection opened through it (`inner().connect(..)`) has its noq
+    /// driver spawned on the *caller's* runtime rather than this endpoint's,
+    /// so a forced [`Endpoint::close_within`] cannot drop it; and a clone of
+    /// the `iroh::Endpoint` kept past close holds the UDP sockets open.
     pub fn inner(&self) -> &iroh::Endpoint {
         &self.inner
     }
@@ -432,9 +553,12 @@ impl Endpoint {
         peer: impl Into<EndpointAddr>,
         alpn: &[u8],
     ) -> Result<Connection> {
-        self.inner
-            .connect(peer, alpn)
-            .await
+        let (inner, peer, alpn) = (self.inner.clone(), peer.into(), alpn.to_vec());
+        // On the endpoint's runtime: that is where noq spawns the
+        // connection's driver task.
+        self.driver
+            .run(async move { inner.connect(peer, &alpn).await })
+            .await?
             .map_err(|e| Error::Endpoint(format!("connect: {e}")))
     }
 
@@ -454,6 +578,11 @@ impl Endpoint {
     /// consult [`Endpoint::acceptor`] themselves. Prefer
     /// [`Endpoint::accept_dispatch`], which wires the hook in for you.
     /// Returns `None` once the endpoint is closed.
+    ///
+    /// Awaiting the returned `Incoming` spawns its connection driver on the
+    /// caller's runtime, out of reach of a forced [`Endpoint::close_within`]
+    /// (see [`Endpoint::inner`]); `accept_dispatch` runs the handshake on the
+    /// endpoint's own runtime.
     pub async fn accept(&self) -> Option<Incoming> {
         self.inner.accept().await
     }
@@ -476,8 +605,9 @@ impl Endpoint {
         while let Some(incoming) = self.inner.accept().await {
             let handlers = handlers.clone();
             let acceptor = acceptor.clone();
+            let driver = self.driver.clone();
             tokio::spawn(async move {
-                if let Err(e) = dispatch_one(incoming, handlers, acceptor).await {
+                if let Err(e) = dispatch_one(incoming, handlers, acceptor, &driver).await {
                     tracing::warn!(error = %e, "mshr accept_dispatch: connection failed");
                 }
             });
@@ -485,9 +615,140 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Close the endpoint. Idempotent.
-    pub async fn close(&self) {
-        self.inner.close().await;
+    /// Close the endpoint, forcing it down if it has not drained within
+    /// [`DEFAULT_CLOSE_DEADLINE`]. See [`Endpoint::close_within`].
+    pub async fn close(&self) -> CloseOutcome {
+        self.close_within(DEFAULT_CLOSE_DEADLINE).await
+    }
+
+    /// Close the endpoint: close every connection, wait up to `deadline`
+    /// for them to drain, then stop every task the endpoint runs.
+    ///
+    /// A graceful close waits until each connection has drained, which is
+    /// normally 3×PTO. It can instead take noq's whole idle timeout (30 s):
+    /// a server connection whose first packet was the dialer's
+    /// handshake-time CONNECTION_CLOSE never gets a drain timer in noq
+    /// 1.0.0-rc.0 (R945-B1). iroh cannot abandon its own close once started,
+    /// so past `deadline` mshr drops the endpoint's runtime instead, and with
+    /// it every driver still holding the UDP sockets. The sockets are then
+    /// released when the last clone of this `Endpoint` is dropped, exactly
+    /// as after a drained close.
+    ///
+    /// Idempotent: concurrent and later calls wait for, and return, the
+    /// first call's outcome.
+    pub async fn close_within(&self, deadline: Duration) -> CloseOutcome {
+        *self
+            .driver
+            .closed
+            .get_or_init(|| async {
+                let inner = self.inner.clone();
+                let graceful = self.driver.run(async move { inner.close().await });
+                let outcome = match tokio::time::timeout(deadline, graceful).await {
+                    Ok(Ok(())) => CloseOutcome::Drained,
+                    // `Ok(Err)` is the runtime going away under the close,
+                    // which only a forced shutdown does: not a drain either.
+                    Ok(Err(_)) | Err(_) => CloseOutcome::Forced,
+                };
+                if outcome == CloseOutcome::Forced {
+                    tracing::warn!(
+                        ?deadline,
+                        "mshr: endpoint did not drain in time; forcing it down \
+                         (a connection mid-handshake, R945-B1)"
+                    );
+                }
+                self.driver.shut_down().await;
+                outcome
+            })
+            .await
+    }
+}
+
+/// How long [`Endpoint::close`] waits for connections to drain before it
+/// forces the endpoint down. A healthy drain is 3×PTO: about 3 s for a dial
+/// still at the initial RTT, well under a second otherwise.
+pub const DEFAULT_CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How [`Endpoint::close_within`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// Every connection drained; peers saw the close.
+    Drained,
+    /// The deadline passed first and the endpoint's tasks were dropped. A
+    /// peer whose CONNECTION_CLOSE was lost learns of it by idle timeout.
+    Forced,
+}
+
+/// Grace for [`Driver::shut_down`] to drop the endpoint's tasks. Dropping a
+/// task is prompt; this only bounds a task stuck in a blocking call.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// The tokio runtime that runs every task iroh and noq spawn for one
+/// endpoint (R945-B1).
+///
+/// iroh spawns its tasks onto whichever runtime is current when it is
+/// called, and can cancel them only through a private token that its own
+/// `abort` skips once a close has started. So a stuck close pins the UDP
+/// sockets in the noq drivers with nothing a caller can do about it. Owning
+/// the runtime gives mshr that lever: [`Driver::shut_down`] drops every task
+/// on it. mshr therefore runs every iroh call that spawns (bind, connect,
+/// the accept handshake) through [`Driver::run`].
+struct Driver {
+    handle: tokio::runtime::Handle,
+    /// `None` once shut down.
+    runtime: std::sync::Mutex<Option<tokio::runtime::Runtime>>,
+    /// The first close's outcome; see [`Endpoint::close_within`].
+    closed: tokio::sync::OnceCell<CloseOutcome>,
+}
+
+impl Driver {
+    fn new() -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("mshr-endpoint")
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            handle: runtime.handle().clone(),
+            runtime: std::sync::Mutex::new(Some(runtime)),
+            closed: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    /// Run `fut` on the endpoint's runtime and await it from any context.
+    /// Errs once the runtime has been shut down.
+    async fn run<F>(&self, fut: F) -> Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle
+            .spawn(fut)
+            .await
+            .map_err(|e| Error::Endpoint(format!("endpoint runtime: {e}")))
+    }
+
+    /// Drop every task on the endpoint's runtime and wait until they are
+    /// gone. Idempotent.
+    async fn shut_down(&self) {
+        let runtime = self.runtime.lock().expect("poisoned").take();
+        if let Some(runtime) = runtime {
+            // `shutdown_timeout` blocks, and a runtime may not be dropped
+            // from async context at all.
+            let _ = tokio::task::spawn_blocking(move || {
+                runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE)
+            })
+            .await;
+        }
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        // Last clone gone without a close: the only shutdown that is legal
+        // from any context, async included.
+        if let Some(runtime) = self.runtime.get_mut().ok().and_then(Option::take) {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -512,12 +773,14 @@ async fn dispatch_one(
     incoming: Incoming,
     handlers: Arc<HashMap<Alpn, AlpnHandler>>,
     acceptor: Option<Arc<dyn Acceptor>>,
+    driver: &Driver,
 ) -> anyhow::Result<()> {
     // `Incoming::into_future()` (via IntoFuture) drives the handshake to
     // completion and yields a `Connection<HandshakeCompleted>` whose
     // `alpn()` we can dispatch on and whose `remote_id()` is the peer's
-    // TLS-authenticated `NodeId`.
-    let conn: Connection = incoming.await?;
+    // TLS-authenticated `NodeId`. It runs on the endpoint's runtime, where
+    // noq spawns the connection's driver; the handler below stays on ours.
+    let conn: Connection = driver.run(incoming.into_future()).await??;
 
     // Acceptor hook runs before any application data is read from the
     // connection (we haven't called `accept_bi`/`accept_uni`/etc. yet),
@@ -576,6 +839,54 @@ mod tests {
             handlers.insert(alpn.to_vec(), handler);
             let _ = ep.accept_dispatch(handlers).await;
         })
+    }
+
+    /// With `segmentation_offload(false)` on both ends, a multi-MB stream
+    /// write — hundreds of datagrams, the flight shape that GSO would batch —
+    /// still arrives whole. The knob must change how packets leave, not
+    /// whether they do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gso_off_still_carries_a_multi_megabyte_stream() {
+        const ALPN: &[u8] = b"xlb-net/test/gso-off/v1";
+        const LEN: usize = 3 * 1024 * 1024;
+
+        let bind = || {
+            Endpoint::builder()
+                .keypair(Keypair::generate())
+                .alpns([ALPN])
+                .segmentation_offload(false)
+                .bind()
+        };
+        let alice = bind().await.expect("alice bind");
+        let bob = bind().await.expect("bob bind");
+
+        let sink: AlpnHandler = Arc::new(|conn: Connection| {
+            Box::pin(async move {
+                let (mut send, mut recv) = conn.accept_bi().await?;
+                let got = recv.read_to_end(LEN + 1).await?;
+                send.write_all(&(got.len() as u64).to_le_bytes()).await?;
+                send.finish()?;
+                let _ = conn.closed().await;
+                Ok(())
+            }) as BoxFut<'static, anyhow::Result<()>>
+        });
+        let server = serve(&alice, ALPN, sink);
+
+        let conn = bob.connect_alpn(alice.endpoint_addr(), ALPN).await.expect("connect");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        send.write_all(&payload).await.expect("write");
+        send.finish().expect("finish");
+        let echoed = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(8))
+            .await
+            .expect("the receiver answers")
+            .expect("read the length");
+        assert_eq!(u64::from_le_bytes(echoed.try_into().unwrap()), LEN as u64);
+
+        conn.close(0u32.into(), b"done");
+        alice.close().await;
+        bob.close().await;
+        server.abort();
     }
 
     /// Two endpoints in the same process, directly addressed via
@@ -713,12 +1024,9 @@ mod tests {
         server.abort();
     }
 
-    /// LAN-lane mDNS discovery is wired through to iroh, but real
-    /// multicast in unit-test environments is unreliable (CI sandboxes,
-    /// container networks, hosts with multicast disabled). We keep this
-    /// test as a smoke-check that the builder compiles and binds; an
-    /// end-to-end mDNS round-trip belongs in an environment-conditional
-    /// integration test once the network harness exists.
+    /// Smoke-check that the LAN lane binds everywhere. The real round-trip
+    /// is [`lan_lane_resolves_node_id`], `#[ignore]`d because multicast in
+    /// CI sandboxes and container networks is unreliable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lan_lane_binds() {
         let ep = Endpoint::builder()
@@ -729,6 +1037,69 @@ mod tests {
             .await
             .expect("bind with LAN discovery");
         ep.close().await;
+    }
+
+    /// R938: two endpoints with ONLY the LAN lane find each other by bare
+    /// `EndpointId` — publish through the system responder (dns_sd on
+    /// Apple, mdns-sd elsewhere), browse, resolve, dial. Needs a host where
+    /// multicast works: `cargo test -p mshr --lib lan_lane -- --ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs working local multicast / system mDNS responder"]
+    async fn lan_lane_resolves_node_id() {
+        const ALPN: &[u8] = b"xlb-net/test/lan-resolve/v1";
+
+        let alice = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .discovery(Discovery::new().with_lan())
+            .bind()
+            .await
+            .expect("alice bind");
+        let alice_id = alice.node_id();
+        let bob = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .discovery(Discovery::new().with_lan())
+            .bind()
+            .await
+            .expect("bob bind");
+
+        let alice_handle = alice.clone();
+        let server = tokio::spawn(async move {
+            let mut handlers: HashMap<Alpn, AlpnHandler> = HashMap::new();
+            handlers.insert(
+                ALPN.to_vec(),
+                Arc::new(|conn: Connection| {
+                    Box::pin(async move {
+                        let (mut send, mut recv) = conn.accept_bi().await?;
+                        let buf = recv.read_to_end(64).await?;
+                        send.write_all(&buf).await?;
+                        send.finish()?;
+                        let _ = conn.closed().await;
+                        Ok(())
+                    }) as BoxFut<'static, anyhow::Result<()>>
+                }),
+            );
+            let _ = alice_handle.accept_dispatch(handlers).await;
+        });
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            bob.connect_alpn(EndpointAddr::from(alice_id), ALPN),
+        )
+        .await
+        .expect("lan-lane connect timed out")
+        .expect("lan-lane connect");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"lan").await.unwrap();
+        send.finish().unwrap();
+        let echoed = recv.read_to_end(64).await.unwrap();
+        assert_eq!(echoed, b"lan");
+        conn.close(0u32.into(), b"done");
+
+        alice.close().await;
+        bob.close().await;
+        server.abort();
     }
 
     /// R609-F4: the bound endpoint reports whether a bare NodeId is dialable
@@ -1291,5 +1662,195 @@ mod tests {
         alice.close().await;
         bob.close().await;
         server.abort();
+    }
+
+    /// Every IP path `conn` currently holds, as socket addresses.
+    fn ip_paths(conn: &Connection) -> Vec<SocketAddr> {
+        conn.paths()
+            .iter()
+            .map(|p| match p.remote_addr() {
+                crate::TransportAddr::Ip(a) => *a,
+                other => panic!("relay is off, so no non-IP path may exist: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// R743-F26: `bind_addr` replaces the wildcard sockets, and an endpoint
+    /// bound on one family's loopback keeps every path to a dual-stack peer
+    /// on that family — even when dialed with the peer's full address set,
+    /// v6 included. A second endpoint bound on the other family, to the same
+    /// peer, stays on *its* family: pinning is per endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_addr_pins_an_endpoint_to_its_named_socket() {
+        const ALPN: &[u8] = b"mshr/test/pinned/v1";
+        let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let v6: SocketAddr = "[::1]:0".parse().unwrap();
+
+        let server = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .bind_addr(v4, 8)
+            .bind_addr(v6, 128)
+            .bind()
+            .await
+            .expect("server bind");
+        let _srv = serve(
+            &server,
+            ALPN,
+            Arc::new(|conn: Connection| {
+                Box::pin(async move {
+                    let _ = conn.closed().await;
+                    Ok(())
+                }) as BoxFut<'static, anyhow::Result<()>>
+            }),
+        );
+        let server_addr = server.endpoint_addr();
+        assert!(server_addr.ip_addrs().any(|a| a.is_ipv4()));
+        assert!(server_addr.ip_addrs().any(|a| a.is_ipv6()));
+
+        let pinned4 = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr(v4, 8)
+            .bind()
+            .await
+            .expect("v4 bind");
+        let pinned6 = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr(v6, 128)
+            .bind()
+            .await
+            .expect("v6 bind");
+        let bound4 = pinned4.inner().bound_sockets();
+        assert!(!bound4.is_empty() && bound4.iter().all(|a| a.ip() == v4.ip()), "{bound4:?}");
+        let bound6 = pinned6.inner().bound_sockets();
+        assert!(!bound6.is_empty() && bound6.iter().all(|a| a.ip() == v6.ip()), "{bound6:?}");
+
+        let c4 = pinned4.connect_alpn(server_addr.clone(), ALPN).await.expect("dial v4");
+        let c6 = pinned6.connect_alpn(server_addr, ALPN).await.expect("dial v6");
+        // Let holepunching / path selection settle before judging.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let p4 = ip_paths(&c4);
+        let p6 = ip_paths(&c6);
+        assert!(!p4.is_empty() && p4.iter().all(|a| a.ip() == v4.ip()), "v4-pinned paths: {p4:?}");
+        assert!(!p6.is_empty() && p6.iter().all(|a| a.ip() == v6.ip()), "v6-pinned paths: {p6:?}");
+
+        pinned4.close().await;
+        pinned6.close().await;
+        server.close().await;
+    }
+
+    /// An out-of-range prefix is a caller error iroh rejects; it must
+    /// surface from `bind()`, naming the address, rather than panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_addr_rejects_a_bad_prefix_at_bind() {
+        let err = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr("127.0.0.1:0".parse().unwrap(), 33)
+            .bind()
+            .await
+            .err()
+            .expect("prefix 33 is not a v4 prefix");
+        assert!(err.to_string().contains("bind_addr 127.0.0.1:0/33"), "{err}");
+    }
+
+    /// R945-B1: a server connection whose *first* packet is the dialer's
+    /// handshake-time CONNECTION_CLOSE never drains in noq 1.0.0-rc.0, so the
+    /// graceful close waits out the 30 s idle timeout. `close` must still
+    /// return within its deadline, and the port must be bindable again once
+    /// the endpoint is dropped.
+    ///
+    /// A lossy hop in front of bob drops alice's ClientHello; it opens just
+    /// before alice closes her half-open dial, so the first datagram bob ever
+    /// sees for that connection is the close-only Initial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_is_bounded_when_a_dial_was_aborted_before_we_saw_it() {
+        use std::sync::atomic::AtomicUsize;
+        const ALPN: &[u8] = b"mshr/test/aborted-dial/v1";
+        let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let bob = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .bind_addr(lo, 8)
+            .bind()
+            .await
+            .expect("bob bind");
+        let bob_socket = bob.inner().bound_sockets()[0];
+        let srv = serve(
+            &bob,
+            ALPN,
+            Arc::new(|conn: Connection| {
+                Box::pin(async move {
+                    let _ = conn.closed().await;
+                    Ok(())
+                }) as BoxFut<'static, anyhow::Result<()>>
+            }),
+        );
+
+        let hop = tokio::net::UdpSocket::bind(lo).await.expect("hop bind");
+        let hop_addr = hop.local_addr().unwrap();
+        let open = Arc::new(AtomicBool::new(false));
+        let forwarded = Arc::new(AtomicUsize::new(0));
+        let hop_task = {
+            let (open, forwarded) = (open.clone(), forwarded.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok((n, _)) = hop.recv_from(&mut buf).await {
+                    if open.load(Ordering::SeqCst) {
+                        let _ = hop.send_to(&buf[..n], bob_socket).await;
+                        forwarded.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+
+        let alice = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr(lo, 8)
+            .bind()
+            .await
+            .expect("alice bind");
+        let dial_to = EndpointAddr::new(bob.node_id()).with_ip_addr(hop_addr);
+        let dial = {
+            let alice = alice.clone();
+            tokio::spawn(async move { alice.connect_alpn(dial_to, ALPN).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        open.store(true, Ordering::SeqCst);
+        let alice_close = {
+            let alice = alice.clone();
+            tokio::spawn(async move { alice.close().await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while forwarded.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "alice's close never reached the hop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let bob accept the Initial and fail its handshake.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let closed = tokio::time::timeout(Duration::from_secs(10), bob.close()).await;
+        let took = started.elapsed();
+        assert!(closed.is_ok(), "bob.close() still pending after {took:?}");
+        assert_eq!(closed.unwrap(), CloseOutcome::Forced, "the stuck connection cannot drain");
+        assert!(took < DEFAULT_CLOSE_DEADLINE + Duration::from_secs(2), "close took {took:?}");
+
+        drop(srv);
+        drop(bob);
+        let rebind_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let rebound = loop {
+            match std::net::UdpSocket::bind(bob_socket) {
+                Ok(s) => break Ok(s),
+                Err(e) if std::time::Instant::now() >= rebind_deadline => break Err(e),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert!(rebound.is_ok(), "{bob_socket} still held after close: {rebound:?}");
+
+        hop_task.abort();
+        let _ = dial.await;
+        let _ = alice_close.await;
     }
 }

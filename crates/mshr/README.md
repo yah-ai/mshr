@@ -50,7 +50,7 @@ let keypair = Keypair::load_or_create()?;
 let endpoint = Endpoint::builder(keypair, &["myapp/v1"])
     .discovery(
         Discovery::new()
-            .with_lan()                           // mDNS on the local subnet
+            .with_lan()                           // DNS-SD (Bonjour) on the local subnet
             .with_relays(mshr::default_relays()), // iroh public relay swarm
     )
     .bind()
@@ -106,11 +106,16 @@ The endpoint wraps `iroh::Endpoint` and exposes:
 
 ```rust,ignore
 let discovery = Discovery::new()
-    .with_lan()                                    // mDNS on the local subnet
+    .with_lan()                                    // DNS-SD (Bonjour) on the local subnet
     .with_relays(mshr::default_relays())        // iroh-relay swarm
     .with_static(vec![pinned_addr])                // pinned NodeIds
     .with_external_roster(my_peer_source);         // anything you want
 ```
+
+The LAN lane advertises `_mshr._udp` through the system Bonjour responder on
+Apple platforms and through `mdns-sd` elsewhere. **iOS apps** must declare
+`NSLocalNetworkUsageDescription` and list `_mshr._udp` under
+`NSBonjourServices` in `Info.plist`; no multicast entitlement is needed.
 
 `PeerSource` is a tiny trait — implement it to feed peer hints from your own
 consensus, gossip, mDNS+BLE bridge, raft state, etc. `mshr` merges those

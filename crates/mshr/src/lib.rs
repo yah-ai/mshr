@@ -22,13 +22,15 @@
 pub mod discovery;
 pub mod endpoint;
 pub mod keypair;
+pub mod lan;
 pub mod relay;
 pub mod seeds;
 
 pub use discovery::{default_relays, Discovery, PeerHint, PeerHintStream, PeerSource};
+pub use lan::{LanScope, LanSighting, LanSightings, LanSightingsReceiver};
 pub use endpoint::{
-    AcceptDecision, Acceptor, Endpoint, EndpointBuilder, ACCEPTOR_DENY_ERROR_CODE,
-    ACCEPTOR_DENY_REASON,
+    AcceptDecision, Acceptor, CloseOutcome, Endpoint, EndpointBuilder, ACCEPTOR_DENY_ERROR_CODE,
+    ACCEPTOR_DENY_REASON, DEFAULT_CLOSE_DEADLINE,
 };
 pub use seeds::{RelayChoice, Seed, Seeds};
 // `ApplicationClose`/`ConnectionError` complete the accept-path surface: mshr
@@ -64,6 +66,11 @@ pub use iroh::{RelayMap, RelayMode, RelayUrl};
 // prefer `NodeId`/`NodeAddr` for cross-consumer consistency; either is fine
 // inside the crate boundary.
 pub use iroh::{EndpointAddr, EndpointId, SecretKey};
+
+// `Connection::paths()` yields paths whose `remote_addr()` is a
+// `TransportAddr`; a consumer asserting *which* address a connection runs
+// over (R743-F26's pinned control endpoint) has to be able to name it.
+pub use iroh::TransportAddr;
 pub type NodeId = EndpointId;
 pub type NodeAddr = EndpointAddr;
 

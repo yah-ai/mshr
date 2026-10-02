@@ -1,6 +1,6 @@
 [package]
 name = "mshr"
-version = "0.8.41"
+version = "0.8.42"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ directories = "6.0"
 futures-core = "0.3"
 hex = "0.4"
 iroh = { version = "1.0.0-rc.0", default-features = false, features = ["tls-ring"] }
-iroh-mdns-address-lookup = "0.2.0"
+data-encoding = "2"
 iroh-relay = { version = "1.0.0-rc.0", default-features = false, features = ["server", "tls-ring", "test-utils"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -29,7 +29,22 @@ tracing = "0.1"
 url = "2"
 zeroize = "1"
 
+# LAN lane backends (src/lan): system Bonjour on Apple, mdns-sd elsewhere.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+mdns-sd = { version = "0.21", default-features = false }
+
+# keypair.rs's renameat2(RENAME_NOREPLACE) fallback (R939-B1): the raw
+# syscall, not bionic's renameat2 wrapper, which is unresolved on Android
+# API < 30. musl-safe (no dlopen).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+# Cross-backend interop tests run the mdns-sd backend on Apple too.
+mdns-sd = { version = "0.21", default-features = false }
 tempfile = "3.23"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = "0.3"
