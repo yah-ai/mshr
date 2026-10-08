@@ -69,6 +69,53 @@ fn decode_ignores_strangers() {
     assert!(decode_txt([("a0", "not an addr")]).is_none());
 }
 
+fn ip_addrs(record: &Record) -> Vec<String> {
+    record.data.ip_addrs().map(ToString::to_string).collect()
+}
+
+#[test]
+fn heard_on_rescopes_link_local_only() {
+    // The advertiser wrote its own interface index (14) into the TXT.
+    let record = decode_txt([
+        ("a0", "192.168.1.5:7"),
+        ("a1", "[fe80::1%14]:7"),
+        ("a2", "[fe80::2]:8"),
+        ("a3", "[2001:db8::1]:7"),
+        ("relay", "https://relay.example.org./"),
+        ("scope", "s"),
+    ])
+    .unwrap();
+    let heard = record.heard_on(9);
+    assert_eq!(
+        ip_addrs(&heard),
+        ["192.168.1.5:7", "[2001:db8::1]:7", "[fe80::1%9]:7", "[fe80::2%9]:8"]
+    );
+    assert_eq!(heard.data.relay_urls().count(), 1);
+    assert_eq!(heard.scope.as_deref(), Some("s"));
+}
+
+#[test]
+fn merge_unions_interfaces_deterministically() {
+    let record = public(endpoint_data(&["10.0.0.2:7", "[fe80::1%3]:7"]));
+    let (en0, awdl0) = (record.heard_on(4), record.heard_on(11));
+    let ab = Record::merge(&en0, [&en0, &awdl0]);
+    let ba = Record::merge(&awdl0, [&awdl0, &en0]);
+    assert_eq!(ip_addrs(&ab), ["10.0.0.2:7", "[fe80::1%4]:7", "[fe80::1%11]:7"]);
+    // Equal sets compare equal, so a re-announcement in another order is quiet.
+    assert_eq!(ab, ba);
+    assert_eq!(ab.data.user_data(), record.data.user_data());
+}
+
+#[test]
+fn peer_to_peer_defaults_off_and_switches() {
+    let sightings = LanSightings::new();
+    assert!(!sightings.peer_to_peer());
+    sightings.set_peer_to_peer(true);
+    assert!(sightings.peer_to_peer());
+    sightings.set_peer_to_peer(false);
+    assert!(!sightings.peer_to_peer());
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn txt_wire_round_trips() {
@@ -345,6 +392,42 @@ async fn lan_lookup_sightings_found_then_lost() {
     loop {
         if next_sighting(&mut rx).await == LanSighting::Lost(a_id) {
             break;
+        }
+    }
+}
+
+/// The peer-to-peer switch is live on both ends: a lookup that turns it on
+/// still finds an infrastructure peer, and after turning it off again (a
+/// full rebuild on Apple) it keeps that peer and still hears its updates.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live mDNS responder; run with --ignored"]
+async fn lan_lookup_peer_to_peer_switch_is_live() {
+    let (a_id, a_data) = test_pair();
+    let sightings = LanSightings::new();
+    sightings.set_peer_to_peer(true);
+    let mut rx = sightings.subscribe();
+    let _b = LanLookup::spawn_with(SecretKey::generate().public(), &sightings).unwrap();
+    let a_sightings = LanSightings::new();
+    a_sightings.set_peer_to_peer(true);
+    let a = LanLookup::spawn_with(a_id, &a_sightings).unwrap();
+    a.publish(&a_data);
+    loop {
+        if let LanSighting::Found(info) = next_sighting(&mut rx).await {
+            if info.endpoint_id == a_id {
+                break;
+            }
+        }
+    }
+    sightings.set_peer_to_peer(false);
+    a_sightings.set_peer_to_peer(false);
+    let mut moved = a_data.clone();
+    moved.add_ip_addrs(vec!["10.9.9.9:9".parse().unwrap()]);
+    a.publish(&moved);
+    loop {
+        if let LanSighting::Found(info) = next_sighting(&mut rx).await {
+            if info.endpoint_id == a_id && info.data.ip_addrs().any(|s| s.port() == 9) {
+                break;
+            }
         }
     }
 }

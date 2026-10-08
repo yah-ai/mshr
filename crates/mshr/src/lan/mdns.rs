@@ -3,14 +3,15 @@
 //! find each other. Also compiled on Apple under `cfg(test)` so the
 //! cross-backend interop tests run on the dev Mac.
 
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tracing::{debug, warn};
 
-use super::{decode_txt, parse_instance, Advert, Book, SERVICE_TYPE};
+use super::{decode_txt, parse_instance, Advert, Book, Record, SERVICE_TYPE};
 
 fn ty_domain() -> String {
     format!("{SERVICE_TYPE}.local.")
@@ -52,9 +53,26 @@ impl Backend {
                                 .txt_properties
                                 .iter()
                                 .map(|p| (p.key(), p.val_str()));
-                            if let Some(record) = decode_txt(pairs) {
-                                book.found(id, record);
-                            }
+                            let Some(record) = decode_txt(pairs) else { continue };
+                            // The interfaces the peer's link-local AAAA records
+                            // arrived on: where its TXT's link-local addresses
+                            // are reachable from here (see `Record::heard_on`).
+                            let heard: Vec<Record> = svc
+                                .addresses
+                                .iter()
+                                .filter_map(|ip| match ip {
+                                    ScopedIp::V6(v6) if v6.addr().is_unicast_link_local() => {
+                                        Some(v6.scope_id().index)
+                                    }
+                                    _ => None,
+                                })
+                                .filter(|&i| i != 0)
+                                .collect::<BTreeSet<u32>>()
+                                .into_iter()
+                                .map(|i| record.heard_on(i))
+                                .collect();
+                            let record = if heard.is_empty() { record } else { Record::merge(&record, &heard) };
+                            book.found(id, record);
                         }
                         ServiceEvent::ServiceRemoved(_, fullname) => {
                             if let Some(id) = parse_instance(&fullname) {
@@ -70,6 +88,11 @@ impl Backend {
             current: Mutex::new(None),
         })
     }
+
+    /// No-op: `mdns-sd` runs on the host's ordinary interfaces and has no
+    /// peer-to-peer ones (AWDL is Apple's) to opt into.
+    #[cfg_attr(target_vendor = "apple", allow(dead_code))] // Apple uses dnssd's.
+    pub(crate) fn set_peer_to_peer(&self, _on: bool) {}
 
     /// Replace what we advertise; `None` withdraws it.
     pub(crate) fn advertise(&self, advert: Option<Advert>) {

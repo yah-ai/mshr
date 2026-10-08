@@ -34,6 +34,9 @@
 //! - `a0`..`aN` — one direct socket address each (`1.2.3.4:5`,
 //!   `[fe80::1]:5`). Authoritative: iroh's v4 and v6 sockets can sit on
 //!   different ports and a DNS-SD instance carries only one SRV port.
+//!   A link-local address's `%scope` is the advertiser's own interface
+//!   index; the receiver replaces it with the interface it heard the record
+//!   on, since a scope id means nothing off the host that assigned it.
 //! - `relay` — home relay URL, if any.
 //! - `user-data` — iroh `UserData` (≤245 bytes, so `user-data=` + value
 //!   still fits the 255-byte TXT string limit).
@@ -232,6 +235,56 @@ pub(crate) struct Record {
     pub scope: Option<String>,
 }
 
+impl Record {
+    /// This record as heard on interface `interface` of *this* host: every
+    /// link-local IPv6 address re-scoped to it. A scope id is an interface
+    /// index local to the host that assigned it, so the `%N` an advertiser
+    /// wrote into its TXT names one of *its* interfaces — on the receiver it
+    /// names some other interface, or none. The one interface known to reach
+    /// the peer is the one the record arrived on.
+    ///
+    /// Every link-local address is re-scoped, including any the peer holds on
+    /// a different link: the TXT does not say which link each one is on, so
+    /// such an address becomes a path that simply never answers.
+    pub(crate) fn heard_on(&self, interface: u32) -> Self {
+        self.with_ip_addrs(self.data.ip_addrs().map(|a| rescope(*a, interface)).collect())
+    }
+
+    /// One record for a peer heard on several interfaces: the union of
+    /// every record's addresses (each already [`Record::heard_on`] its
+    /// interface), with relay, user data and scope from `latest`.
+    pub(crate) fn merge<'a>(latest: &Record, all: impl IntoIterator<Item = &'a Record>) -> Self {
+        latest.with_ip_addrs(all.into_iter().flat_map(|r| r.data.ip_addrs().copied()).collect())
+    }
+
+    /// Built from a sorted set, so equal address sets give equal records
+    /// whatever order they were heard in — [`Book::found`] relies on that to
+    /// stay quiet about a re-announcement that changed nothing.
+    fn with_ip_addrs(&self, addrs: BTreeSet<SocketAddr>) -> Self {
+        let mut data = EndpointData::from(addrs);
+        for relay in self.data.relay_urls() {
+            data.add_relay_url(relay.clone());
+        }
+        data.set_user_data(self.data.user_data().cloned());
+        Self {
+            data,
+            scope: self.scope.clone(),
+        }
+    }
+}
+
+/// `addr` with its scope id set to `interface` if it is a link-local IPv6
+/// address; anything else is returned as is.
+pub(crate) fn rescope(addr: SocketAddr, interface: u32) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(mut v6) if v6.ip().is_unicast_link_local() => {
+            v6.set_scope_id(interface);
+            SocketAddr::V6(v6)
+        }
+        other => other,
+    }
+}
+
 /// Decode a peer's TXT pairs. `None` when the record carries no usable
 /// address — a stranger on our service type, or a peer mid-update.
 pub(crate) fn decode_txt<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<Record> {
@@ -304,6 +357,9 @@ struct Advertising {
     /// Weak: the backend owns an `Arc` of this book.
     backend: Option<std::sync::Weak<Backend>>,
     published: Option<EndpointData>,
+    /// [`LanSightings::set_peer_to_peer`]. Kept here, under the same lock as
+    /// `backend`, so a switch racing [`Book::attach`] still reaches it.
+    peer_to_peer: bool,
 }
 
 fn in_scope(scope: &Option<LanScope>, record: &Record) -> bool {
@@ -432,7 +488,27 @@ impl Book {
 
     /// Advertise through `backend` from now on.
     fn attach(&self, backend: &Arc<Backend>) {
-        self.advertising.lock().expect("lan advertising poisoned").backend = Some(Arc::downgrade(backend));
+        let mut advertising = self.advertising.lock().expect("lan advertising poisoned");
+        advertising.backend = Some(Arc::downgrade(backend));
+        backend.set_peer_to_peer(advertising.peer_to_peer);
+    }
+
+    /// Whether the lane also runs over peer-to-peer links (AWDL).
+    pub(crate) fn peer_to_peer(&self) -> bool {
+        self.advertising.lock().expect("lan advertising poisoned").peer_to_peer
+    }
+
+    /// See [`LanSightings::set_peer_to_peer`]. No-op if unchanged.
+    pub(crate) fn set_peer_to_peer(&self, on: bool) {
+        let mut advertising = self.advertising.lock().expect("lan advertising poisoned");
+        if advertising.peer_to_peer == on {
+            return;
+        }
+        debug!(on, "lan: peer-to-peer changed");
+        advertising.peer_to_peer = on;
+        if let Some(backend) = advertising.backend.as_ref().and_then(std::sync::Weak::upgrade) {
+            backend.set_peer_to_peer(on);
+        }
     }
 
     /// iroh published new addresses: advertise them under our scope.
@@ -544,6 +620,28 @@ impl LanSightings {
     /// The scope the lane is in now.
     pub fn scope(&self) -> Option<LanScope> {
         self.book.scope()
+    }
+
+    /// Also advertise, browse and resolve over peer-to-peer links — on
+    /// Apple, AWDL (`awdl0`), which reaches a nearby Apple device with no
+    /// shared Wi-Fi network and no Bluetooth. Off by default, as Apple's own
+    /// APIs have it (`includePeerToPeer`): while it is on, the Wi-Fi radio
+    /// time-shares between AWDL and the infrastructure network, which adds
+    /// latency on the latter.
+    ///
+    /// Live: switching re-registers the advert, so peers on the LAN see a
+    /// brief [`LanSighting::Lost`] then [`LanSighting::Found`] for this
+    /// endpoint; switching off drops every peer only a peer-to-peer link
+    /// reached. Called before the lookup is built, it sets the mode the
+    /// lookup starts in. No effect off Apple platforms, whose responder has
+    /// no peer-to-peer interfaces to include.
+    pub fn set_peer_to_peer(&self, on: bool) {
+        self.book.set_peer_to_peer(on);
+    }
+
+    /// Whether [`LanSightings::set_peer_to_peer`] is on.
+    pub fn peer_to_peer(&self) -> bool {
+        self.book.peer_to_peer()
     }
 
     /// Everyone advertising right now.

@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Changed — iroh and iroh-relay 1.0.0-rc.0 → 1.3
+
+- No mshr API change. Internally `CaRootsConfig`/`ca_roots_config` became
+  iroh 1.3's `CaTlsConfig`/`ca_tls_config`.
+- noq 1.3 now drains a server connection whose first packet was the dialer's
+  handshake-time CONNECTION_CLOSE (R945-B1), so that close is graceful again.
+  `close_within`'s forced path stays: iroh still cannot abandon a close it
+  has started, and a peer that vanishes without answering still holds a drain
+  for 3×PTO. Its test now uses such a peer.
+
+### Added — LAN lane over AWDL (`LanSightings::set_peer_to_peer`)
+
+- `LanSightings::set_peer_to_peer(bool)` / `peer_to_peer()`: on Apple, the
+  LAN lane also registers, browses and resolves over peer-to-peer links
+  (`kDNSServiceFlagsIncludeP2P | kDNSServiceFlagsIncludeAWDL`), so a nearby
+  Apple device with no shared Wi-Fi network is sighted over `awdl0`. Off by
+  default, matching Apple's `includePeerToPeer`: while on, the Wi-Fi radio
+  time-shares with the infrastructure network. Live; switching re-registers
+  the advert. No effect on the `mdns-sd` backend.
+
+### Fixed — link-local LAN addresses carried the advertiser's scope id
+
+- A `[fe80::x%N]:p` TXT address kept the advertiser's interface index `N`,
+  which on the receiver names another interface or none. Each link-local
+  address is now re-scoped to the interface the record was heard on (the
+  dns_sd Resolve's interface; on `mdns-sd`, the interfaces the peer's
+  link-local AAAA records arrived on). A peer heard on several interfaces
+  gets one address per interface.
+
 ### Added — LAN discovery scopes (`LanScope`)
 
 - `LanScope` partitions one LAN into private discovery groups: the LAN lane

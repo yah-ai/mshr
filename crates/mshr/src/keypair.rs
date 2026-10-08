@@ -17,7 +17,6 @@
 //!
 //! @yah:relay(R939, "mshr identity creation on Android (SELinux denies hard_link)")
 //! @yah:at(2026-09-23T06:20:40Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:next("Reported by @Ashguard (noisetable R742-F1/T4), 2026-09-23. Child bug carries evidence + fix options.")
 

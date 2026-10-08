@@ -104,10 +104,10 @@
 //! @yah:verify("cd oss/mshr && RUSTDOCFLAGS='-D warnings' cargo doc -p mshr --no-deps   # clean")
 //! @yah:verify("cd oss/xlb && cargo check -p xlb --all-targets   # clean — additive change breaks no consumer")
 //! @yah:verify("cd oss/yubaba && cargo check -p yubaba   # clean")
+//! @yah:gotcha("\"RESOLVED 2026-10-07 (noisetable R742-T16, @Glimmerstone:hydra session:c5c18b67; the operator chose to push the bump forward rather than hold it). The iroh/iroh-relay '1.0.0-rc.0' -> '1.3' bump in oss/mshr and oss/xlb (xlb also gets iroh-blobs 0.101 -> 0.103) broke ROOT resolution at 10:50, which @Ashguard:vortex caught on R953 and reverted at 10:59. It is re-applied (uncommitted), and the root lock now carries it: `cargo update -p iroh@1.0.0-rc.0 --precise 1.3.0`. A cfg_aliases-only update cannot work, because workspace-hack has iroh-base locked at rc.0. Result: iroh 1.3.0, cfg_aliases 0.2.2, iroh-blobs 0.103.1, noq 1.3. `cargo hakari generate` rewrote workspace-hack's iroh-base/iroh-metrics to '1'; `hakari verify` OK. Green with --all-targets: root -p yah (+mshr), desktop, rpc-ssh (+mshr), push-relay; oss/yubaba -p yubaba; oss/xlb --workspace; oss/cheers -p cheers-providers (+lan-pair). mshr 64/0 lib tests. noq 1.3 now drains R945-B1's aborted dial, so close_is_bounded_when_a_dial_was_aborted_before_we_saw_it asserts Drained, and the new close_within_forces_a_connection_that_has_not_drained covers the forced path.\"")
 //!
 //! @yah:relay(R945, "mshr endpoint lifecycle over noq/iroh 1.0.0-rc.0: close and rebind")
 //! @yah:at(2026-09-28T00:29:08Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //!
 //! @yah:ticket(R945-B1, "Endpoint::close never drains a server-side connection mid-handshake (MultipathNotNegotiated), noq/iroh 1.0.0-rc.0")
@@ -137,7 +137,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{presets, BindOpts, Connection, Incoming, QuicTransportConfig};
-use iroh::tls::CaRootsConfig;
+use iroh::tls::CaTlsConfig;
 use iroh::{RelayMap, RelayMode};
 
 use crate::{Discovery, EndpointAddr, Error, Keypair, NodeId, Result};
@@ -207,7 +207,8 @@ where
 /// Builder for [`Endpoint`]. Returned by [`Endpoint::builder`].
 ///
 /// @yah:relay(R944, "mshr 0.8.42: land + release noisetable's uncommitted EndpointBuilder additions (segmentation_offload, bind_addr, TransportAddr re-export)")
-/// @yah:at(2026-10-01T23:04:08Z)
+/// @yah:status(review)
+/// @yah:at(2026-10-02T01:06:33Z)
 /// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:next("Commit through yah's flow (NOT from noisetable): uncommitted in oss/mshr/crates/mshr. (1) noisetable R743-F27: EndpointBuilder::segmentation_offload(bool) in src/endpoint.rs (field + method + bind() wiring into QuicTransportConfig::enable_segmentation_offload, installed only when set, like the datagram knobs), test endpoint::tests::gso_off_still_carries_a_multi_megabyte_stream (3 MiB stream, GSO off both ends), CHANGELOG [Unreleased] entry 'Added - EndpointBuilder::segmentation_offload'. Why: iroh 1.0.0-rc.0 snapshots max_transmit_segments at TransportsSender creation (iroh socket/transports.rs:415, :1201), so noq-udp's EIO GSO fallback never reaches the connection and every multi-datagram flight is dropped on a NIC without GSO (Android emulator). (2) noisetable R743-F26: EndpointBuilder::bind_addr(addr, prefix_len) + `pub use iroh::TransportAddr` in lib.rs, tests bind_addr_pins_an_endpoint_to_its_named_socket / bind_addr_rejects_a_bad_prefix_at_bind.")
 /// @yah:next("Bump mshr to 0.8.42 (working copy is 0.8.41) and publish. `cargo test -p mshr --lib endpoint::` was 17 passed on 2026-09-25.")
@@ -216,6 +217,12 @@ where
 /// @yah:gotcha("The wizard's commit-and-tag runs `git commit -a` on the live tree, so it sweeps in whatever is uncommitted at that moment. At launch that included oss/cheers/crates/cheers-axum/src/passkey.rs and .yah/AGENTS.md, which are not R944 edits.")
 /// @yah:handoff("Wizard reruns at 0.8.42 were blocked by stale tests left by the store-plugin commits (3c7c8665/8fb16523), fixed in this pass: (a) app/yah/cli/src/plugin_grants.rs every_builtin_manifest_lowers_on_both_backends gained a yah-store arm (only outbound rule is the proxy's exact loopback port, proxy env set); live every_builtin_grant_set_produces_a_profile_that_boots now spawns with a stand-in egress proxy, since a hostname grant refuses to lower without one. plugin_grants:: 31/31 pass. (b) crates/yah/agent-tools/src/skill_tools.rs tripwire 11 -> 14 (chaos, store-asset-portal, store-console). Runs c8f664f2 and 1d900460 failed at release-check on these.")
 /// @yah:handoff("More release-check fixes: (c) crates/yah/fleet-metrics/tests/fleet_inventory_split.rs us-west-014 EXPECTED -> 100.64.0.11 (R935-T4 re-join). (d) oss/yubaba/crates/yubaba/cluster-epochs.json cluster_protocol surface re-recorded, NOT BREAKING, surface_rerecords entry 2026-10-01: R937-F3 added a `machine` key to GET /raft/status member JSON; all consumers tolerate unknown keys. (e) xtask/tests/mirror_ingress.rs: us-south-001 now declares cap:bundle-serving on disk (R936-B12); in-memory grant narrowed to us-west-001 and capable list updated; its no-appliance taint keeps live placements unchanged. Full workspace cargo test + xtask tests + drift guards green locally.")
+/// @yah:handoff("mshr 0.8.42 published to crates.io via full lockstep release-wizard run 0cf05278-67c6-44eb-ab69-86fb3d8a397b (operator asked for the full wizard rather than an mshr-only bump). Carries EndpointBuilder::segmentation_offload, EndpointBuilder::bind_addr, and the mshr::TransportAddr re-export, with CHANGELOG entries for all three. Noisetable can now pin mshr = 0.8.42 and run `scripts/devcrate.sh off mshr` (R743-F26/F27 there).")
+/// @yah:verify("yah-release-check green in run 0cf05278 after fixes (a)-(e) listed in handoff")
+/// @yah:cleanup("Upstream: file with iroh — re-read max_transmit_segments after a GSO fallback instead of caching it at TransportsSender creation (socket/transports.rs:415, :1201); that would let mshr drop the segmentation_offload workaround.")
+/// @yah:handoff("Release 0.8.42 run 0cf05278: every publish step green (crates incl. mshr 0.8.42, tag pushed, binaries, CLI, mesofact, site, desktop). Fleet: prod voters us-east-001/us-south-001/us-west-001 verified on 0.8.42 via plan roll-yubaba-1790913141 (epochs 8/7). Non-voter us-west-003 was refused by the preflight (state_epoch 6 -> 7). Operator chose migrate-now: the box is single-node with no raft log or snapshot on disk (/var/lib/yah-cloud holds only identity + service-records.json), so I backed up to /var/tmp/yah-cloud-pre-0.8.42.tgz, kept the 0.8.41 binaries at /var/tmp/{yubaba,kamaji}-0.8.41, and installed the manifest-verified 0.8.42 pair. /health reports 0.8.42 with epochs 8/7 and both services active. The wizard's roll-the-fleet gate was then declined in the answer queue (not by this session), so republish-site-after-roll (`yah cloud apply --service yah-marketing --env prod`) did not run.")
+/// @yah:gotcha("roll-the-fleet's advance predicate counts one verified rollout-plan file per leg. A non-voter upgraded outside `yah cloud rollout` (as us-west-003 was, because the preflight refuses any state_epoch gap even when the node has no raft state to migrate) can never satisfy it. Standalone nodes with no raft dir probably shouldn't be gated on state_epoch at all.")
+/// @yah:handoff("Operator chose A: ran republish-site-after-roll by hand (`yah cloud apply --service yah-marketing --env prod`), which exited 0. yah-marketing reported ok (1 component reconciled), and the yah-dev and cdn-yah-dev domains are bound. Release 0.8.42 is now complete end to end.")
 pub struct EndpointBuilder {
     keypair: Option<Keypair>,
     alpns: Vec<Alpn>,
@@ -314,7 +321,7 @@ impl EndpointBuilder {
 
     /// Skip TLS certificate verification on relay connections. **Tests
     /// only** — required when the relay uses a self-signed cert. Mirrors
-    /// `iroh::CaRootsConfig::insecure_skip_verify()`.
+    /// `iroh::tls::CaTlsConfig::insecure_skip_verify()`.
     pub fn insecure_skip_tls_verify(mut self, skip: bool) -> Self {
         self.insecure_skip_tls_verify = skip;
         self
@@ -343,7 +350,7 @@ impl EndpointBuilder {
     ///
     /// Turn it off on a host whose NIC cannot do GSO. In principle `noq-udp`
     /// falls back by itself: the first GSO `sendmsg` that fails with `EIO`
-    /// sets its segment limit to 1. But iroh 1.0.0-rc.0 snapshots
+    /// sets its segment limit to 1. But iroh (1.0.0-rc.0 through 1.3) snapshots
     /// `max_transmit_segments` once, when the transport sender is created
     /// (`socket/transports.rs`), and keeps handing the connection the stale
     /// value. So every later multi-segment transmit is built anyway and dropped
@@ -419,7 +426,7 @@ impl EndpointBuilder {
             .secret_key(keypair.secret().clone())
             .relay_mode(relay_mode);
         if self.insecure_skip_tls_verify {
-            b = b.ca_roots_config(CaRootsConfig::insecure_skip_verify());
+            b = b.ca_tls_config(CaTlsConfig::insecure_skip_verify());
         }
         // Only build a transport config when a datagram knob was actually
         // set. `QuicTransportConfig::builder()` is not `noq`'s default — it
@@ -625,14 +632,14 @@ impl Endpoint {
     /// for them to drain, then stop every task the endpoint runs.
     ///
     /// A graceful close waits until each connection has drained, which is
-    /// normally 3×PTO. It can instead take noq's whole idle timeout (30 s):
-    /// a server connection whose first packet was the dialer's
-    /// handshake-time CONNECTION_CLOSE never gets a drain timer in noq
-    /// 1.0.0-rc.0 (R945-B1). iroh cannot abandon its own close once started,
-    /// so past `deadline` mshr drops the endpoint's runtime instead, and with
-    /// it every driver still holding the UDP sockets. The sockets are then
-    /// released when the last clone of this `Endpoint` is dropped, exactly
-    /// as after a drained close.
+    /// normally 3×PTO. A connection that never drains holds it for noq's
+    /// whole idle timeout (30 s). noq 1.0.0-rc.0 had one: a server connection
+    /// whose first packet was the dialer's handshake-time CONNECTION_CLOSE
+    /// never got a drain timer (R945-B1). noq 1.3 drains it, but iroh still
+    /// cannot abandon its own close once started, so past `deadline` mshr
+    /// drops the endpoint's runtime instead, and with it every driver still
+    /// holding the UDP sockets. The sockets are then released when the last
+    /// clone of this `Endpoint` is dropped, exactly as after a drained close.
     ///
     /// Idempotent: concurrent and later calls wait for, and return, the
     /// first call's outcome.
@@ -652,8 +659,7 @@ impl Endpoint {
                 if outcome == CloseOutcome::Forced {
                     tracing::warn!(
                         ?deadline,
-                        "mshr: endpoint did not drain in time; forcing it down \
-                         (a connection mid-handshake, R945-B1)"
+                        "mshr: endpoint did not drain in time; forcing it down"
                     );
                 }
                 self.driver.shut_down().await;
@@ -1755,10 +1761,12 @@ mod tests {
     }
 
     /// R945-B1: a server connection whose *first* packet is the dialer's
-    /// handshake-time CONNECTION_CLOSE never drains in noq 1.0.0-rc.0, so the
-    /// graceful close waits out the 30 s idle timeout. `close` must still
-    /// return within its deadline, and the port must be bindable again once
-    /// the endpoint is dropped.
+    /// handshake-time CONNECTION_CLOSE never drained in noq 1.0.0-rc.0, so the
+    /// graceful close waited out the 30 s idle timeout and `close` had to
+    /// force it. noq 1.3 drains it: the close is graceful, well inside the
+    /// deadline, and the port is bindable again once the endpoint is dropped.
+    /// The forced path itself is pinned by
+    /// `close_within_forces_a_connection_that_has_not_drained`.
     ///
     /// A lossy hop in front of bob drops alice's ClientHello; it opens just
     /// before alice closes her half-open dial, so the first datagram bob ever
@@ -1834,8 +1842,8 @@ mod tests {
         let closed = tokio::time::timeout(Duration::from_secs(10), bob.close()).await;
         let took = started.elapsed();
         assert!(closed.is_ok(), "bob.close() still pending after {took:?}");
-        assert_eq!(closed.unwrap(), CloseOutcome::Forced, "the stuck connection cannot drain");
-        assert!(took < DEFAULT_CLOSE_DEADLINE + Duration::from_secs(2), "close took {took:?}");
+        assert_eq!(closed.unwrap(), CloseOutcome::Drained, "noq 1.3 drains an aborted dial");
+        assert!(took < DEFAULT_CLOSE_DEADLINE, "close took {took:?}");
 
         drop(srv);
         drop(bob);
@@ -1852,5 +1860,82 @@ mod tests {
         hop_task.abort();
         let _ = dial.await;
         let _ = alice_close.await;
+    }
+
+    /// The forced half of `close_within`: a connection that has not drained
+    /// by the deadline is torn down with the endpoint's runtime, and the port
+    /// is bindable again once the endpoint is dropped. noq 1.3 drains a
+    /// close the peer answers within a loopback round trip, so the peer
+    /// here vanishes without a word (its runtime, drivers and socket gone,
+    /// as when a phone walks out of range). Bob's CONNECTION_CLOSE then goes
+    /// unanswered and his drain must run its full 3×PTO, at least 75 ms
+    /// because PTO includes the 25 ms max_ack_delay: well past a 10 ms
+    /// deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_within_forces_a_connection_that_has_not_drained() {
+        use tokio::sync::Notify;
+        const ALPN: &[u8] = b"mshr/test/forced-close/v1";
+        let lo: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let bob = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .bind_addr(lo, 8)
+            .bind()
+            .await
+            .expect("bob bind");
+        let bob_socket = bob.inner().bound_sockets()[0];
+        let accepted = Arc::new(Notify::new());
+        let srv = {
+            let accepted = accepted.clone();
+            serve(
+                &bob,
+                ALPN,
+                Arc::new(move |conn: Connection| {
+                    let accepted = accepted.clone();
+                    Box::pin(async move {
+                        accepted.notify_one();
+                        let _ = conn.closed().await;
+                        Ok(())
+                    }) as BoxFut<'static, anyhow::Result<()>>
+                }),
+            )
+        };
+
+        let alice = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr(lo, 8)
+            .bind()
+            .await
+            .expect("alice bind");
+        let conn = alice
+            .connect_alpn(EndpointAddr::new(bob.node_id()).with_ip_addr(bob_socket), ALPN)
+            .await
+            .expect("dial bob");
+        tokio::time::timeout(Duration::from_secs(5), accepted.notified())
+            .await
+            .expect("bob never accepted");
+
+        alice.driver.shut_down().await;
+
+        let started = std::time::Instant::now();
+        let outcome = bob.close_within(Duration::from_millis(10)).await;
+        let took = started.elapsed();
+        assert_eq!(outcome, CloseOutcome::Forced, "an unanswered close cannot drain in 10 ms");
+        assert!(took < Duration::from_secs(2), "forced close took {took:?}");
+        assert_eq!(bob.close().await, CloseOutcome::Forced, "close is idempotent");
+
+        drop(srv);
+        drop(bob);
+        let rebind_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let rebound = loop {
+            match std::net::UdpSocket::bind(bob_socket) {
+                Ok(s) => break Ok(s),
+                Err(e) if std::time::Instant::now() >= rebind_deadline => break Err(e),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert!(rebound.is_ok(), "{bob_socket} still held after a forced close: {rebound:?}");
+        drop(conn);
     }
 }
