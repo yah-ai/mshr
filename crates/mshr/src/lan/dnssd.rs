@@ -9,9 +9,10 @@
 //! same thread; anything they would start or stop is queued and applied
 //! after it returns, so no callback re-enters the API.
 //!
-//! Flow: Browse `_mshr._udp` → per new instance, Resolve (kept open so TXT
-//! changes stream in) → decode TXT into the [`Book`]. Browse removal on the
-//! instance's last interface stops the Resolve and drops the peer.
+//! Flow: Browse `_mshr._udp` → per new instance, a TXT record query (kept
+//! open so TXT changes stream in) → decode TXT into the [`Book`]. Browse
+//! removal on the instance's last interface stops the query and drops the
+//! peer.
 //!
 //! Peer-to-peer links (AWDL) are excluded from `kDNSServiceInterfaceIndexAny`
 //! unless a call sets `kDNSServiceFlagsIncludeP2P`, and AWDL specifically
@@ -19,13 +20,21 @@
 //! neither, per [`super::LanSightings::set_peer_to_peer`]; a switch tears the
 //! connection down and rebuilds it under the new flags.
 //!
-//! A Resolve answers once per interface it hears the peer on, and each answer
-//! is kept separately ([`Seen::records`]), its link-local addresses re-scoped
-//! to that interface ([`super::Record::heard_on`]); the Book gets their
-//! union. Browse reports anything found over a peer-to-peer link under the
-//! pseudo index `kDNSServiceInterfaceIndexP2P`, while the Resolve reports
-//! the real `awdl0` index, so the two are reconciled by interface kind
-//! ([`is_peer_to_peer`]) rather than by index.
+//! The TXT comes from `DNSServiceQueryRecord`, not `DNSServiceResolve`. A
+//! Resolve keeps ONE TXT and ONE SRV for the instance across every
+//! interface: each reply carries the TXT added last on *any* interface,
+//! labelled with the interface of whichever record's arrival triggered it,
+//! and removals are never delivered, they only blank the slot until both
+//! record types arrive again. Measured on macOS against an iPad over USB,
+//! Wi-Fi and AWDL (noisetable R803-B20): three replies labelled `en0` while
+//! the TXT records sat on `en8`, `en9` and `en0`. So per-interface
+//! bookkeeping built on Resolve replies files one interface's TXT under
+//! another, and once an interface goes away it keeps whichever TXT was
+//! filed under the survivor. A record query reports every TXT record
+//! mDNSResponder holds, each with the interface it was heard on, and reports
+//! removals too. [`TxtRecords`] mirrors exactly that set, every link-local
+//! address re-scoped to its record's interface ([`super::Record::heard_on`]),
+//! and the Book gets the union.
 //!
 //! @yah:relay(R961, "mshr LAN lane over AWDL: Apple dns_sd excludes awdl0 by default (no kDNSServiceFlagsIncludeAWDL), and a resolved fe80 address keeps the advertiser's scope id")
 //! @yah:status(review)
@@ -93,16 +102,17 @@ type BrowseReply = extern "C" fn(
     *const c_char,
     *mut c_void,
 );
-type ResolveReply = extern "C" fn(
+type QueryRecordReply = extern "C" fn(
     DNSServiceRef,
     DNSServiceFlags,
     u32,
     DNSServiceErrorType,
     *const c_char,
-    *const c_char,
+    u16,
     u16,
     u16,
     *const u8,
+    u32,
     *mut c_void,
 );
 
@@ -142,17 +152,29 @@ extern "C" {
         callback: BrowseReply,
         context: *mut c_void,
     ) -> DNSServiceErrorType;
-    fn DNSServiceResolve(
+    fn DNSServiceQueryRecord(
         sd_ref: *mut DNSServiceRef,
         flags: DNSServiceFlags,
         interface_index: u32,
-        name: *const c_char,
-        regtype: *const c_char,
-        domain: *const c_char,
-        callback: ResolveReply,
+        fullname: *const c_char,
+        rrtype: u16,
+        rrclass: u16,
+        callback: QueryRecordReply,
         context: *mut c_void,
     ) -> DNSServiceErrorType;
+    fn DNSServiceConstructFullName(
+        full_name: *mut c_char,
+        service: *const c_char,
+        regtype: *const c_char,
+        domain: *const c_char,
+    ) -> DNSServiceErrorType;
 }
+
+/// `kDNSServiceType_TXT` / `kDNSServiceClass_IN`.
+const TYPE_TXT: u16 = 16;
+const CLASS_IN: u16 = 1;
+/// `kDNSServiceMaxDomainName`: the buffer `DNSServiceConstructFullName` fills.
+const MAX_DOMAIN_NAME: usize = 1009;
 
 /// How long the thread blocks in `poll` before checking for commands.
 const TICK_MS: c_int = 200;
@@ -253,39 +275,104 @@ pub(crate) fn decode_txt_wire(mut bytes: &[u8]) -> Vec<(String, String)> {
 }
 
 enum Pending {
-    StartResolve(String),
-    StopResolve(String),
+    StartQuery(String),
+    StopQuery(String),
 }
 
 #[derive(Default)]
 struct Seen {
-    /// Interfaces browse currently reports the instance on: real indices,
-    /// plus [`IF_INDEX_P2P`] for anything found over a peer-to-peer link.
+    /// Interfaces browse currently reports the instance on. Only whether it
+    /// is empty matters: which addresses each interface reached is
+    /// [`TxtRecords`]' business.
     interfaces: BTreeSet<u32>,
-    resolve: Option<DNSServiceRef>,
-    /// The record as resolved on each interface (the Resolve's index, always
-    /// a real one), its link-local addresses scoped to that interface.
-    records: BTreeMap<u32, Record>,
-    /// Interface of the most recent Resolve answer, whose relay, user data
-    /// and scope the merged record carries.
-    latest: u32,
+    /// The instance's TXT record query, kept open.
+    query: Option<DNSServiceRef>,
+    txt: TxtRecords,
 }
 
-impl Seen {
-    /// Forget answers from interfaces browse no longer reports. Browse names
-    /// a peer-to-peer link only by [`IF_INDEX_P2P`], so while that is live
-    /// every peer-to-peer answer stays.
-    fn prune(&mut self) {
-        let p2p = self.interfaces.contains(&IF_INDEX_P2P);
-        let interfaces = &self.interfaces;
-        self.records
-            .retain(|i, _| interfaces.contains(i) || (p2p && is_peer_to_peer(*i)));
+/// Every TXT record mDNSResponder holds for one instance, as its record
+/// query reports them: added and removed one record at a time, each keyed by
+/// the interface it was heard on and its rdata, since a removal names
+/// exactly that pair. Several can coexist on one interface (mDNS keeps every
+/// member of a record set received within a second of the others).
+///
+/// @yah:ticket(R961-B1, "dnssd: a kept-open DNSServiceResolve files one interface's TXT under another and never reports removals, so a peer met over USB+AWDL keeps a stale record once the cable goes (noisetable R803-B20); track TXT records with DNSServiceQueryRecord")
+/// @yah:status(review)
+/// @yah:at(2026-10-09T00:47:34Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R961)
+/// @yah:severity(high)
+/// @yah:handoff("ROOT CAUSE (found under noisetable R803-B20, courier Glimmerstone session:f1fa3113, 2026-10-08). R961's receiver used a kept-open DNSServiceResolve and kept one Record per reply interface (Seen::records, pruned by browse). A Resolve keeps ONE TXT slot and ONE SRV slot across every interface. Each reply carries the TXT added last on any interface, labelled with the interface of whichever record triggered it. A removal is never delivered: it blanks the slot, and the Resolve stays silent until both record types arrive again. Read from mDNSResponder uds_daemon.c (main), resolve_result_save_answer / resolve_result_callback. Measured on this Mac in /tmp/b20-s1-monitor.log, from /tmp/b20-scripts/monitor.py, which runs Resolve and QueryRecord side by side. Two RESOLVE replies were labelled en9, yet one carried the stale TXT that the TXT query placed on en0. At the cable pull, the en8/en9 removals produced no Resolve reply at all.")
+/// @yah:handoff("FIX (oss/mshr/crates/mshr/src/lan/dnssd.rs). Each browsed instance gets a kept-open DNSServiceQueryRecord(TXT) on the shared connection; the full name comes from DNSServiceConstructFullName. The new TxtRecords holds exactly the TXT records mDNSResponder reports, keyed by (interface, rdata), each record's link-local addresses re-scoped to its own interface. Removals apply; relay, user data and scope come from the latest record; the Book gets the union. Browse now only decides whether the instance exists, so Seen::prune and the P2P-index reconciliation are gone. is_peer_to_peer stays for leave_peer_to_peer. Module doc rewritten. CHANGELOG [Unreleased] has a Fixed entry. The temporary b20_trace hooks were removed after the hardware run.")
+/// @yah:handoff("HARDWARE (noisetable R803-B20 run, Mac + iPad, iPad Wi-Fi off from Control Center, Bluetooth off; app launched and desk booted with the cable IN, then the cable pulled). Before the pull, the iPad's record of the desk was scoped %13 (awdl0), %4 and %6 (USB). After it, three queries over a minute read [v4s, fe80::f4cd:c0ff:fe7f:f1d%13] (the desk's awdl0 address). Étude 655 passed (Verdict 0), and every iroh path::selected to the iPad was Mac awdl0 fe80 -> iPad awdl0 fe80%16. The iPad-side trace, /tmp/b20-s1-ipad.trace, shows the desk's registration-time TXT (IPv4 only) arriving on awdl0 twice, once per desk process, and coexisting with the full TXT for 2-6 s until mDNS flushed it. Under the Resolve model, one reply filing it under awdl0, followed by any removal that silenced the Resolve, gives exactly R803-B20 run 3's frozen IPv4-only record.")
+/// @yah:handoff("OBSERVATION, not acted on (the decision is this camp's). Over AWDL a fresh P2P query on macOS swapped the iOS mshr advertiser's current TXT for its registration-time TXT: TXT RMV current, then ADD a 1-entry TXT on awdl0. Seen twice, on two app launches. mshr registers iroh's first publish, which can lack the link-local addresses noisetable adds a moment later, so a receiver handed only that TXT on awdl0 would again lack the awdl0 address. Python and desk advertisers on macOS never showed it toward the iPad in 7 variants. Not needed for R803-B20's acceptance; an advertiser-side settle before the first register would remove the exposure.")
+/// @yah:verify("cd oss/mshr && cargo test -p mshr --lib lan:: -- --include-ignored --test-threads=1 -> 25 passed (R961 baseline 22, +3 new: txt_records_follow_each_interface_through_a_cable_pull, txt_records_remove_exactly_what_was_named, txt_records_carry_the_latest_records_metadata)")
+/// @yah:verify("cd oss/mshr && cargo test -p mshr -> lib 70 passed / 8 ignored, other binaries 2+3+1 (76 total; R961 baseline 73)")
+/// @yah:verify("cd oss/mshr && cargo clippy -p mshr --all-targets -> clean; cargo check -p mshr --target aarch64-apple-ios -> clean")
+#[derive(Debug, Default)]
+pub(super) struct TxtRecords {
+    /// Decoded, link-local addresses re-scoped to the key's interface.
+    held: BTreeMap<(u32, Vec<u8>), Record>,
+    /// The key added most recently, whose relay, user data and scope the
+    /// merged record carries.
+    latest: Option<(u32, Vec<u8>)>,
+}
+
+impl TxtRecords {
+    /// mDNSResponder added `rdata` as a TXT record heard on `interface`.
+    /// Returns whether what [`Self::merged`] gives may have changed. A TXT
+    /// without a usable address (a stranger on our service type, a peer
+    /// mid-update) is not held.
+    pub(super) fn add(&mut self, interface: u32, rdata: &[u8]) -> bool {
+        let pairs = decode_txt_wire(rdata);
+        let Some(record) = decode_txt(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) else {
+            return false;
+        };
+        // A pseudo index (LocalOnly: a peer on this same host) names no link,
+        // and on this host the advertiser's own scope ids are already the
+        // right ones.
+        let record = if interface == 0 || interface >= IF_INDEX_PSEUDO_MIN {
+            record
+        } else {
+            record.heard_on(interface)
+        };
+        let key = (interface, rdata.to_vec());
+        self.held.insert(key.clone(), record);
+        self.latest = Some(key);
+        true
     }
 
-    /// What the Book should hold: every interface's answer, unioned.
-    fn merged(&self) -> Option<Record> {
-        let latest = self.records.get(&self.latest).or_else(|| self.records.values().next())?;
-        Some(Record::merge(latest, self.records.values()))
+    /// mDNSResponder removed the TXT record `rdata` heard on `interface`
+    /// (a goodbye, an expiry, a newer record set flushing it, or the
+    /// interface going away).
+    pub(super) fn remove(&mut self, interface: u32, rdata: &[u8]) -> bool {
+        let key = (interface, rdata.to_vec());
+        if self.held.remove(&key).is_none() {
+            return false;
+        }
+        if self.latest.as_ref() == Some(&key) {
+            self.latest = None;
+        }
+        true
+    }
+
+    /// Drop every record heard on an interface `keep` rejects.
+    pub(super) fn retain_interfaces(&mut self, keep: impl Fn(u32) -> bool) {
+        self.held.retain(|(interface, _), _| keep(*interface));
+        if self.latest.as_ref().is_some_and(|(interface, _)| !keep(*interface)) {
+            self.latest = None;
+        }
+    }
+
+    /// What the Book should hold: every record's addresses, unioned. `None`
+    /// while no record is held.
+    pub(super) fn merged(&self) -> Option<Record> {
+        let latest = self
+            .latest
+            .as_ref()
+            .and_then(|key| self.held.get(key))
+            .or_else(|| self.held.values().next_back())?;
+        Some(Record::merge(latest, self.held.values()))
     }
 }
 
@@ -316,9 +403,11 @@ impl State {
     /// interface still reaches it.
     fn report(&self, name: &str) {
         let Some(id) = parse_instance(name) else { return };
-        match self.seen.get(name).map(Seen::merged) {
+        match self.seen.get(name).map(|seen| seen.txt.merged()) {
             Some(Some(record)) => self.book.found(id, record),
-            Some(None) => {} // Browse sees it; no Resolve answer yet.
+            // Browse sees it but no TXT record is held: none has arrived yet,
+            // or one record set was removed and its successor is still to come.
+            Some(None) => {}
             None => self.book.lost(id),
         }
     }
@@ -330,7 +419,7 @@ impl State {
         for name in names {
             let Some(seen) = self.seen.get_mut(&name) else { continue };
             seen.interfaces.retain(|i| !is_peer_to_peer(*i));
-            seen.prune();
+            seen.txt.retain_interfaces(|i| !is_peer_to_peer(i));
             if seen.interfaces.is_empty() {
                 self.seen.remove(&name);
             }
@@ -540,9 +629,9 @@ fn apply_pending(st: &mut State, ctx: *mut c_void) {
     let flags = st.flags();
     for p in std::mem::take(&mut st.pending) {
         match p {
-            Pending::StartResolve(name) => {
+            Pending::StartQuery(name) => {
                 let Some(seen) = st.seen.get_mut(&name) else { continue };
-                if seen.resolve.is_some() {
+                if seen.query.is_some() {
                     continue;
                 }
                 let (Ok(cname), Ok(regtype), Ok(domain)) = (
@@ -552,29 +641,45 @@ fn apply_pending(st: &mut State, ctx: *mut c_void) {
                 ) else {
                     continue;
                 };
-                let mut r = st.conn;
-                // SAFETY: r starts as the main ref (ShareConnection).
+                let mut fullname = [0 as c_char; MAX_DOMAIN_NAME];
+                // SAFETY: fullname is kDNSServiceMaxDomainName bytes, as the
+                // call requires; the inputs are NUL-terminated.
                 let err = unsafe {
-                    DNSServiceResolve(
-                        &mut r,
-                        flags,
-                        0,
+                    DNSServiceConstructFullName(
+                        fullname.as_mut_ptr(),
                         cname.as_ptr(),
                         regtype.as_ptr(),
                         domain.as_ptr(),
-                        on_resolve,
+                    )
+                };
+                if err != ERR_NO_ERROR {
+                    warn!(err, %name, "lan: DNSServiceConstructFullName failed");
+                    continue;
+                }
+                let mut r = st.conn;
+                // SAFETY: r starts as the main ref (ShareConnection); fullname
+                // is NUL-terminated by the call above.
+                let err = unsafe {
+                    DNSServiceQueryRecord(
+                        &mut r,
+                        flags,
+                        0,
+                        fullname.as_ptr(),
+                        TYPE_TXT,
+                        CLASS_IN,
+                        on_txt,
                         ctx,
                     )
                 };
                 if err == ERR_NO_ERROR {
-                    seen.resolve = Some(r);
+                    seen.query = Some(r);
                 } else {
-                    warn!(err, %name, "lan: DNSServiceResolve failed");
+                    warn!(err, %name, "lan: DNSServiceQueryRecord failed");
                 }
             }
-            Pending::StopResolve(name) => {
+            Pending::StopQuery(name) => {
                 if let Some(seen) = st.seen.remove(&name) {
-                    if let Some(r) = seen.resolve {
+                    if let Some(r) = seen.query {
                         // SAFETY: live subordinate ref.
                         unsafe { DNSServiceRefDeallocate(r) };
                     }
@@ -647,72 +752,63 @@ extern "C" fn on_browse(
     if flags & FLAGS_ADD != 0 {
         let seen = st.seen.entry(name.clone()).or_default();
         seen.interfaces.insert(interface);
-        if seen.resolve.is_none() {
-            st.pending.push(Pending::StartResolve(name));
+        if seen.query.is_none() {
+            st.pending.push(Pending::StartQuery(name));
         }
     } else if let Some(seen) = st.seen.get_mut(&name) {
         seen.interfaces.remove(&interface);
+        // Still reachable elsewhere, nothing to do here: the TXT query
+        // reports the removal of whatever this interface held.
         if seen.interfaces.is_empty() {
-            st.pending.push(Pending::StopResolve(name));
-        } else {
-            // Still reachable elsewhere: drop only what this interface heard.
-            seen.prune();
-            st.report(&name);
+            st.pending.push(Pending::StopQuery(name));
         }
     }
 }
 
-extern "C" fn on_resolve(
+extern "C" fn on_txt(
     sd: DNSServiceRef,
-    _flags: DNSServiceFlags,
+    flags: DNSServiceFlags,
     interface: u32,
     err: DNSServiceErrorType,
-    fullname: *const c_char,
-    _host: *const c_char,
-    _port_be: u16,
-    txt_len: u16,
-    txt: *const u8,
+    _fullname: *const c_char,
+    rrtype: u16,
+    _rrclass: u16,
+    rdlen: u16,
+    rdata: *const u8,
+    _ttl: u32,
     ctx: *mut c_void,
 ) {
     if err != ERR_NO_ERROR {
-        warn!(err, "lan: resolve error");
+        warn!(err, "lan: TXT query error");
+        return;
+    }
+    if rrtype != TYPE_TXT {
         return;
     }
     // SAFETY: see `state`.
     let st = unsafe { state(ctx) };
-    // SAFETY: mDNSResponder-supplied C string or NULL.
-    let Some(fullname) = (unsafe { cstr(fullname) }) else { return };
-    if parse_instance(&fullname).is_none() {
-        return;
-    }
-    // The browse name this Resolve was started for (`fullname` is escaped
-    // and domain-qualified, so match by ref instead).
+    // The browse name this query was started for (`fullname` is escaped and
+    // domain-qualified, so match by ref instead).
     let Some(name) = st
         .seen
         .iter()
-        .find_map(|(name, seen)| (seen.resolve == Some(sd)).then(|| name.clone()))
+        .find_map(|(name, seen)| (seen.query == Some(sd)).then(|| name.clone()))
     else {
         return;
     };
-    let bytes = if txt.is_null() {
+    let bytes = if rdata.is_null() {
         &[][..]
     } else {
-        // SAFETY: mDNSResponder guarantees txt_len readable bytes.
-        unsafe { std::slice::from_raw_parts(txt, txt_len as usize) }
-    };
-    let pairs = decode_txt_wire(bytes);
-    let Some(record) = decode_txt(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))) else {
-        return;
-    };
-    // A pseudo index (LocalOnly: a peer on this same host) names no link, and
-    // on this host the advertiser's own scope ids are already the right ones.
-    let record = if interface == 0 || interface >= IF_INDEX_PSEUDO_MIN {
-        record
-    } else {
-        record.heard_on(interface)
+        // SAFETY: mDNSResponder guarantees rdlen readable bytes.
+        unsafe { std::slice::from_raw_parts(rdata, rdlen as usize) }
     };
     let seen = st.seen.get_mut(&name).expect("found above");
-    seen.records.insert(interface, record);
-    seen.latest = interface;
-    st.report(&name);
+    let changed = if flags & FLAGS_ADD != 0 {
+        seen.txt.add(interface, bytes)
+    } else {
+        seen.txt.remove(interface, bytes)
+    };
+    if changed {
+        st.report(&name);
+    }
 }

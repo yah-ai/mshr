@@ -133,6 +133,114 @@ fn txt_wire_round_trips() {
     );
 }
 
+/// TXT rdata advertising `addrs` as `a0`, `a1`, ...
+#[cfg(target_vendor = "apple")]
+fn txt_rdata(addrs: &[&str]) -> Vec<u8> {
+    let pairs: Vec<(String, String)> =
+        addrs.iter().enumerate().map(|(i, a)| (format!("a{i}"), a.to_string())).collect();
+    dnssd::encode_txt(&pairs)
+}
+
+/// noisetable R803-B20, the iPad of R803-F18's hardware run: it met the desk
+/// over USB (its interfaces 4 and 6) and AWDL (awdl0, 13), then the cable
+/// was pulled. A record query reports each TXT record with the interface it
+/// was heard on: the pull removes the USB copies, and the desk's next TXT
+/// replaces the awdl0 one (added, then the old one flushed). What is left is
+/// the desk as awdl0 holds it, its fe80 scoped to awdl0, nothing scoped to
+/// a link that is gone.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn txt_records_follow_each_interface_through_a_cable_pull() {
+    let (usb_a, usb_b, awdl0) = (4, 6, 13);
+    let cable_in = txt_rdata(&[
+        "100.64.0.5:57115",
+        "169.254.125.242:57115",
+        "[fe80::5cf8:edff:fee5:4bae]:62180",
+        "[fe80::818:d1ff:fedb:9251]:62180",
+    ]);
+    let mut txt = dnssd::TxtRecords::default();
+    for interface in [usb_a, usb_b, awdl0] {
+        assert!(txt.add(interface, &cable_in));
+    }
+    let both = txt.merged().expect("held");
+    assert!(ip_addrs(&both).contains(&"[fe80::818:d1ff:fedb:9251%13]:62180".to_string()));
+    assert!(ip_addrs(&both).contains(&"[fe80::5cf8:edff:fee5:4bae%4]:62180".to_string()));
+
+    // The cable goes: mDNSResponder purges both USB interfaces' records.
+    assert!(txt.remove(usb_a, &cable_in));
+    assert!(txt.remove(usb_b, &cable_in));
+    assert_eq!(
+        ip_addrs(&txt.merged().expect("awdl0 still holds one")),
+        [
+            "100.64.0.5:57115",
+            "169.254.125.242:57115",
+            "[fe80::818:d1ff:fedb:9251%13]:62180",
+            "[fe80::5cf8:edff:fee5:4bae%13]:62180",
+        ]
+    );
+
+    // The desk retracts what only the cable reached: over awdl0 the new TXT
+    // arrives and the old one is flushed after it.
+    let cable_out = txt_rdata(&["100.64.0.5:57115", "[fe80::818:d1ff:fedb:9251]:62180"]);
+    assert!(txt.add(awdl0, &cable_out));
+    assert!(txt.remove(awdl0, &cable_in));
+    assert_eq!(
+        ip_addrs(&txt.merged().expect("held")),
+        ["100.64.0.5:57115", "[fe80::818:d1ff:fedb:9251%13]:62180"]
+    );
+}
+
+/// A removal names one (interface, rdata) pair and takes exactly that: the
+/// same rdata held on another interface, or another member of the same
+/// interface's record set, stays. A TXT with no usable address is never held.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn txt_records_remove_exactly_what_was_named() {
+    let one = txt_rdata(&["10.0.0.2:7", "[fe80::1]:8"]);
+    let two = txt_rdata(&["10.0.0.3:7"]);
+    let mut txt = dnssd::TxtRecords::default();
+    assert!(!txt.add(5, &dnssd::encode_txt(&[("txtvers".into(), "1".into())])));
+    assert!(txt.merged().is_none());
+    assert!(txt.add(5, &one));
+    assert!(txt.add(5, &two));
+    assert!(txt.add(9, &one));
+    // Never held: nothing changes.
+    assert!(!txt.remove(7, &one));
+    assert!(txt.remove(5, &one));
+    assert_eq!(
+        ip_addrs(&txt.merged().expect("held")),
+        ["10.0.0.2:7", "10.0.0.3:7", "[fe80::1%9]:8"]
+    );
+    txt.retain_interfaces(|interface| interface != 9);
+    assert_eq!(ip_addrs(&txt.merged().expect("held")), ["10.0.0.3:7"]);
+    assert!(txt.remove(5, &two));
+    assert!(txt.merged().is_none());
+}
+
+/// Relay, user data and scope come from the record added last, and still
+/// come from a held record once that one is removed.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn txt_records_carry_the_latest_records_metadata() {
+    let with = |relay: &str, addr: &str| {
+        dnssd::encode_txt(&[
+            ("a0".into(), addr.into()),
+            ("relay".into(), relay.into()),
+            ("scope".into(), "s".into()),
+        ])
+    };
+    let old = with("https://old.example.org./", "10.0.0.2:7");
+    let new = with("https://new.example.org./", "10.0.0.3:7");
+    let mut txt = dnssd::TxtRecords::default();
+    txt.add(4, &old);
+    txt.add(13, &new);
+    let relay = |txt: &dnssd::TxtRecords| txt.merged().unwrap().data.relay_urls().next().unwrap().to_string();
+    assert_eq!(relay(&txt), "https://new.example.org./");
+    assert_eq!(txt.merged().unwrap().scope.as_deref(), Some("s"));
+    txt.remove(13, &new);
+    assert_eq!(relay(&txt), "https://old.example.org./");
+}
+
 /// Poll `book` until it holds `id`, or give up.
 async fn wait_for(book: &Book, id: &EndpointId) -> Option<EndpointData> {
     for _ in 0..100 {

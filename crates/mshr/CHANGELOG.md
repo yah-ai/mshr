@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed — LAN lane on Apple keeps a stale record once one of a peer's links goes (R961-B1)
+
+- The dns_sd backend reads a peer's TXT with a kept-open
+  `DNSServiceQueryRecord` instead of `DNSServiceResolve`. A Resolve keeps one
+  TXT for every interface, labels each reply with whichever interface's record
+  triggered it, and never reports a removal, so a peer met over USB and AWDL
+  could be left with an old TXT filed under `awdl0` once the cable was pulled,
+  and with no later update ever delivered (noisetable R803-B20: an iPad held a
+  desk's registration-time TXT, without its `awdl0` address, for 11+ minutes).
+  The record query reports every TXT record with the interface it was heard on,
+  and every removal; the sighting is the union of what is currently held.
+
 ### Changed — iroh and iroh-relay 1.0.0-rc.0 → 1.3
 
 - No mshr API change. Internally `CaRootsConfig`/`ca_roots_config` became
