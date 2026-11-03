@@ -133,10 +133,10 @@ use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::endpoint::{presets, BindOpts, Connection, Incoming, QuicTransportConfig};
+use iroh::endpoint::{presets, BindOpts, Connection, Incoming, PathEvent, QuicTransportConfig};
 use iroh::tls::CaTlsConfig;
 use iroh::{RelayMap, RelayMode};
 
@@ -483,6 +483,7 @@ impl EndpointBuilder {
             registered_alpns: Arc::new(alpns),
             acceptor: self.acceptor,
             resolves_bare_node_ids,
+            last_path: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -500,6 +501,63 @@ pub struct Endpoint {
     /// as a bool rather than the whole `Discovery` because `Discovery` is
     /// consumed by the iroh builder and the answer cannot change afterwards.
     resolves_bare_node_ids: bool,
+    /// Selected-path class of the most recent connection `connect_alpn`
+    /// opened to each peer, kept current by a watcher task that holds no
+    /// strong handle (so it never extends a connection's life) and
+    /// survives the connection, so the answer is still readable after the
+    /// caller dropped it. Read by [`Endpoint::path_class`].
+    last_path: Arc<Mutex<HashMap<NodeId, Arc<Mutex<PathClass>>>>>,
+}
+
+/// Which path a live connection is actually transmitting on.
+///
+/// This is the SELECTED path of one connection, not the endpoint's address
+/// book: knowing a peer's direct addresses says nothing about whether any
+/// of them is routable from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathClass {
+    /// Selected path is an IP (hole-punched or LAN) path.
+    Direct,
+    /// Selected path goes through a relay server.
+    Relay,
+    /// The connection is open but has no selected path (or only a custom
+    /// transport).
+    None,
+}
+
+impl PathClass {
+    /// Classify from the selected path's flags. Pure, so it is testable
+    /// without a live connection.
+    pub fn from_selected(is_ip: bool, is_relay: bool) -> Self {
+        match (is_ip, is_relay) {
+            (true, _) => PathClass::Direct,
+            (false, true) => PathClass::Relay,
+            (false, false) => PathClass::None,
+        }
+    }
+
+    /// Stable lowercase label: `direct` / `relay` / `none`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PathClass::Direct => "direct",
+            PathClass::Relay => "relay",
+            PathClass::None => "none",
+        }
+    }
+
+    /// Classify a selected path's remote address.
+    pub fn of_addr(addr: &crate::TransportAddr) -> Self {
+        Self::from_selected(addr.is_ip(), addr.is_relay())
+    }
+
+    /// Read the selected path off a live connection.
+    pub fn of_connection(conn: &Connection) -> Self {
+        let paths = conn.paths();
+        match paths.iter().find(|p| p.is_selected()) {
+            Some(p) => Self::from_selected(p.is_ip(), p.is_relay()),
+            None => PathClass::None,
+        }
+    }
 }
 
 impl Endpoint {
@@ -561,12 +619,56 @@ impl Endpoint {
         alpn: &[u8],
     ) -> Result<Connection> {
         let (inner, peer, alpn) = (self.inner.clone(), peer.into(), alpn.to_vec());
+        let peer_id = peer.id;
         // On the endpoint's runtime: that is where noq spawns the
         // connection's driver task.
-        self.driver
+        let conn = self
+            .driver
             .run(async move { inner.connect(peer, &alpn).await })
             .await?
-            .map_err(|e| Error::Endpoint(format!("connect: {e}")))
+            .map_err(|e| Error::Endpoint(format!("connect: {e}")))?;
+        self.watch_path(peer_id, &conn);
+        Ok(conn)
+    }
+
+    /// Track `conn`'s selected path into the per-peer cell. The event
+    /// stream is subscribed BEFORE the snapshot seeds the cell, so a
+    /// selection that lands between the two is not lost.
+    fn watch_path(&self, peer: NodeId, conn: &Connection) {
+        let mut events = Box::pin(conn.path_events());
+        let weak = conn.weak_handle();
+        let cell = Arc::new(Mutex::new(PathClass::of_connection(conn)));
+        if let Ok(mut m) = self.last_path.lock() {
+            m.insert(peer, cell.clone());
+        }
+        tokio::spawn(async move {
+            use futures_core::Stream;
+            while let Some(ev) = std::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await {
+                let class = match ev {
+                    PathEvent::Selected { remote_addr, .. } => PathClass::of_addr(&remote_addr),
+                    // Missed events: re-read if the connection is still up.
+                    PathEvent::Lagged { .. } => match weak.upgrade() {
+                        Some(c) => PathClass::of_connection(&c),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if let Ok(mut c) = cell.lock() {
+                    *c = class;
+                }
+            }
+        });
+    }
+
+    /// The path the most recent connection to `peer` is transmitting on, or
+    /// `None` if `connect_alpn` never dialled it. Reports the LAST selected
+    /// path even after that connection was dropped, so a caller can read it
+    /// after the RPC finished. A connection that started on the relay and
+    /// upgraded reports `Direct` once it has.
+    pub fn path_class(&self, peer: NodeId) -> Option<PathClass> {
+        let cell = self.last_path.lock().ok()?.get(&peer)?.clone();
+        let class = *cell.lock().ok()?;
+        Some(class)
     }
 
     /// The registered connection-acceptor hook, if any. `None` means the
@@ -1743,6 +1845,62 @@ mod tests {
 
         pinned4.close().await;
         pinned6.close().await;
+        server.close().await;
+    }
+
+    #[test]
+    fn path_class_follows_the_selected_path() {
+        assert_eq!(PathClass::from_selected(true, false), PathClass::Direct);
+        assert_eq!(PathClass::from_selected(false, true), PathClass::Relay);
+        assert_eq!(PathClass::from_selected(false, false), PathClass::None);
+        assert_eq!(PathClass::Direct.as_str(), "direct");
+        assert_eq!(PathClass::Relay.as_str(), "relay");
+        assert_eq!(PathClass::None.as_str(), "none");
+    }
+
+    /// A loopback dial has a routable IP path, so the live connection must
+    /// classify `direct` (the address book would say the same, which is why
+    /// the contrast case is the unit test above); once the connection is
+    /// dropped the last answer is retained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_class_reads_the_live_connection() {
+        const ALPN: &[u8] = b"mshr/test/pathclass/v1";
+        let v4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .alpns([ALPN])
+            .bind_addr(v4, 8)
+            .bind()
+            .await
+            .expect("server bind");
+        let _srv = serve(
+            &server,
+            ALPN,
+            Arc::new(|conn: Connection| {
+                Box::pin(async move {
+                    let _ = conn.closed().await;
+                    Ok(())
+                }) as BoxFut<'static, anyhow::Result<()>>
+            }),
+        );
+        let client = Endpoint::builder()
+            .keypair(Keypair::generate())
+            .bind_addr(v4, 8)
+            .bind()
+            .await
+            .expect("client bind");
+        let peer = server.node_id();
+        assert_eq!(client.path_class(peer), None, "no connection yet");
+
+        let conn = client.connect_alpn(server.endpoint_addr(), ALPN).await.expect("dial");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(client.path_class(peer), Some(PathClass::Direct));
+
+        // Still readable after the connection is gone.
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.path_class(peer), Some(PathClass::Direct));
+        client.close().await;
         server.close().await;
     }
 

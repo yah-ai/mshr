@@ -29,7 +29,7 @@ pub mod seeds;
 pub use discovery::{default_relays, Discovery, PeerHint, PeerHintStream, PeerSource};
 pub use lan::{LanScope, LanSighting, LanSightings, LanSightingsReceiver};
 pub use endpoint::{
-    AcceptDecision, Acceptor, CloseOutcome, Endpoint, EndpointBuilder, ACCEPTOR_DENY_ERROR_CODE,
+    AcceptDecision, Acceptor, CloseOutcome, Endpoint, EndpointBuilder, PathClass, ACCEPTOR_DENY_ERROR_CODE,
     ACCEPTOR_DENY_REASON, DEFAULT_CLOSE_DEADLINE,
 };
 pub use seeds::{RelayChoice, Seed, Seeds};
